@@ -46,6 +46,7 @@
 | **Por dia** | Gasto agregado por data |
 | **Limites Go** | Barras de progresso de Uso Contínuo, Semanal e Mensal |
 | **Projeção 30 dias** | Calcula se o ritmo atual vai estourar o limite mensal |
+| **i18n** | Detecta o idioma do navegador — painel em português ou inglês |
 | **Cache** | Dados persistem entre páginas (via GM_setValue) |
 | **Paginação** | Escaneia automaticamente todas as páginas do histórico |
 

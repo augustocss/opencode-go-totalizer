@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.0
-// @description  Totalizador de credito/uso do OpenCode Go. Mostra total geral, breakdown por modelo e por dia, e limites reais do Go.
+// @version      1.1
+// @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
 // @grant        GM_addStyle
@@ -18,6 +18,54 @@
   const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
   const PAGINATION_SELECTOR = '[data-slot="pagination"]';
   const PAGE_SCAN_DELAY = 1200;
+
+  const locale = (navigator.language || "").startsWith("pt") ? "pt" : "en";
+  const _ = (() => {
+    const strings = {
+      pt: {
+        byModel: "Por modelo",
+        byDay: "Por dia",
+        scanBtn: "Escanear todas as p\u00e1ginas",
+        scanningBtn: "Escaneando...",
+        resetBtn: "Resetar",
+        requests: "requisi\u00e7\u00f5es",
+        scanningPage: "Escaneando p\u00e1gina",
+        allPages: "Todas as p\u00e1ginas",
+        tokens: "Tokens",
+        _in: "in",
+        _out: "out",
+        fallbackLimits: "Limites Go: 5h $12 \u00b7 Semanal $30 \u00b7 Mensal $60",
+        projection: (pct) =>
+          `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
+      },
+      en: {
+        byModel: "By model",
+        byDay: "By day",
+        scanBtn: "Scan all pages",
+        scanningBtn: "Scanning...",
+        resetBtn: "Reset",
+        requests: "requests",
+        scanningPage: "Scanning page",
+        allPages: "All pages",
+        tokens: "Tokens",
+        _in: "in",
+        _out: "out",
+        fallbackLimits: "Go limits: 5h $12 \u00b7 Weekly $30 \u00b7 Monthly $60",
+        projection: (pct) =>
+          `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
+      },
+    };
+    const dict = strings[locale] || strings.en;
+    return (key, ...args) => {
+      const val = dict[key];
+      return typeof val === "function" ? val(...args) : val;
+    };
+  })();
+  const limitLabels = {
+    "Uso Cont\u00ednuo": locale === "en" ? "Continuous Usage" : undefined,
+    Semanal: locale === "en" ? "Weekly" : undefined,
+    Mensal: locale === "en" ? "Monthly" : undefined,
+  };
 
   function parseCost(text) {
     const m = text.match(/Go\s*\(\$([\d.]+)\)/);
@@ -328,18 +376,18 @@
       </div>
       <div class="oc-breakdowns">
         <div class="oc-breakdown">
-          <h4>Por modelo</h4>
+          <h4>${_("byModel")}</h4>
           <div id="oc-by-model"></div>
         </div>
         <div class="oc-breakdown">
-          <h4>Por dia</h4>
+          <h4>${_("byDay")}</h4>
           <div id="oc-by-day"></div>
         </div>
       </div>
       <div class="oc-limits" id="oc-limits"></div>
       <div class="oc-buttons">
-        <button class="oc-btn" id="oc-scan-btn">Escanear todas as paginas</button>
-        <button class="oc-btn" id="oc-reset-btn">Resetar</button>
+        <button class="oc-btn" id="oc-scan-btn">${_("scanBtn")}</button>
+        <button class="oc-btn" id="oc-reset-btn">${_("resetBtn")}</button>
       </div>
     `;
 
@@ -362,15 +410,15 @@
 
     document.getElementById("oc-grand-total").textContent = `$${total.toFixed(2)}`;
     document.getElementById("oc-meta").textContent =
-      `${count} requisicoes` + (scanning ? ` | Escaneando pagina ${pageNum}...` : " | Todas as paginas") +
-      ` | Tokens: ${tokensIn.toLocaleString()} in / ${tokensOut.toLocaleString()} out`;
+      `${count} ${_("requests")}` + (scanning ? ` | ${_("scanningPage")} ${pageNum}...` : ` | ${_("allPages")}`) +
+      ` | ${_("tokens")}: ${tokensIn.toLocaleString()} ${_("_in")} / ${tokensOut.toLocaleString()} ${_("_out")}`;
 
     document.getElementById("oc-by-model").innerHTML = modelEntries
       .map(([m, c]) => {
         const tIn = (tokensInByModel[m] || 0).toLocaleString();
         const tOut = (tokensOutByModel[m] || 0).toLocaleString();
         return `<div class="oc-breakdown-row">
-          <span><strong>${m}</strong> <span style="color:#888;font-size:10px">in:${tIn} out:${tOut}</span></span>
+          <span><strong>${m}</strong> <span style="color:#888;font-size:10px">${_("_in")}:${tIn} ${_("_out")}:${tOut}</span></span>
           <span class="oc-cost">$${c.toFixed(2)}</span>
         </div>`;
       })
@@ -384,10 +432,10 @@
 
     document.getElementById("oc-scan-btn").onclick = () => {
       const btn = document.getElementById("oc-scan-btn");
-      btn.textContent = "Escaneando...";
+      btn.textContent = _("scanningBtn");
       btn.classList.add("scanning");
       scanAllPages().finally(() => {
-        btn.textContent = "Escanear todas as paginas";
+        btn.textContent = _("scanBtn");
         btn.classList.remove("scanning");
       });
     };
@@ -531,12 +579,13 @@
 
   function renderLimits(limits) {
     if (!limits || limits.length === 0) {
-      return `<span class="oc-limits-info">Limites Go: 5h $12 &middot; Semanal $30 &middot; Mensal $60</span>`;
+      return `<span class="oc-limits-info">${_("fallbackLimits")}</span>`;
     }
 
     return limits
       .map((l) => {
         let color, extra = "", barPct = l.pct;
+        const translatedLabel = limitLabels[l.label] || l.label;
 
         if (l.pct < 50) color = "#00d4aa";
         else if (l.pct < 80) color = "#f0c040";
@@ -551,14 +600,14 @@
             color = "#ff6b6b";
             barPct = Math.min(l.pct, 100);
             extra = `<div style="font-size:10px;color:#ff6b6b;margin-top:2px">
-              Projecao: ${projPct}% no fim do mes — vai estourar o limite no ritmo atual
+              ${_("projection", projPct)}
             </div>`;
           }
         }
 
         return `<div style="flex:1;min-width:140px">
           <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
-            <span>${l.label}</span><span style="color:${color};font-weight:600">${l.pct}%</span>
+            <span>${translatedLabel}</span><span style="color:${color};font-weight:600">${l.pct}%</span>
           </div>
           <div style="background:#333;border-radius:3px;height:6px;overflow:hidden">
             <div style="width:${barPct}%;height:100%;background:${color};border-radius:3px;transition:width .3s"></div>

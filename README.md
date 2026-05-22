@@ -44,6 +44,7 @@ A Tampermonkey userscript that adds a floating panel to the OpenCode usage page,
 | **By day** | Spending aggregated by date |
 | **Go limits** | Live progress bars for Continuous, Weekly, and Monthly usage |
 | **30-day projection** | Estimates if current pace will exceed the monthly cap |
+| **i18n** | Auto-detects browser language — panel in English or Portuguese |
 | **Persistent cache** | Data survives page navigation (via GM_setValue) |
 | **Paginated scanning** | Automatically fetches all history pages |
 
