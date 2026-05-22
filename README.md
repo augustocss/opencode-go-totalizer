@@ -3,58 +3,56 @@
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✅-brightgreen)](https://www.tampermonkey.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Totalizador de crédito/uso do OpenCode Go.** Um userscript para Tampermonkey que adiciona um painel flutuante na página de uso do OpenCode, mostrando:
+> 🇧🇷 [Leia em português](README.pt-BR.md)
 
-- **Total geral** de todos os custos somados
-- **Breakdown por modelo** — quanto cada modelo consumiu (custo e tokens in/out)
-- **Breakdown por dia** — gasto por data
-- **Limites do Go em tempo real** — busca os percentuais de Uso Contínuo, Semanal e Mensal direto da página `/go`
-- **Projeção mensal** — calcula se o ritmo atual vai estourar o limite de $60/mês
+A Tampermonkey userscript that adds a floating panel to the OpenCode usage page, showing:
 
-*(Adicione aqui um screenshot do painel em ação)*
+- **Grand total** of all usage costs
+- **Breakdown by model** — cost and tokens (in/out) per AI model
+- **Breakdown by day** — spending grouped by date
+- **Live Go limits** — fetches usage percentages (Continuous, Weekly, Monthly) from the `/go` page
+- **30-day projection** — warns if your current burn rate will exceed the $60 monthly cap
 
-## Instalação
+## Installation
 
-1. Instale a extensão [Tampermonkey](https://www.tampermonkey.net/) no seu navegador:
+1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser:
    - [Chrome](https://chrome.google.com/webstore/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo)
    - [Firefox](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/)
    - [Edge](https://microsoftedge.microsoft.com/addons/detail/tampermonkey/iikmkjmpaadaobahmlepeloendndfphd)
 
-2. Abra o arquivo [`opencode-go-totalizer.user.js`](opencode-go-totalizer.user.js) e copie o conteúdo (ou clique no link raw).
+2. Open [`opencode-go-totalizer.user.js`](opencode-go-totalizer.user.js) and click the **Raw** button (or copy the contents).
 
-3. No Tampermonkey, clique no ícone da extensão → **Adicionar novo script**.
+3. Tampermonkey should automatically recognize it and open the install screen. Click **Install**.
 
-4. Apague o conteúdo padrão e cole o script.
+   Alternatively, in Tampermonkey click **Add new script**, paste the code, and press `Ctrl+S` to save.
 
-5. Pressione `Ctrl+S` (ou `Cmd+S`) para salvar.
+4. Navigate to your OpenCode workspace usage page (`/workspace/wrk_.../go`). The panel will appear automatically at the top of the usage table.
 
-6. Pronto! Navegue até a página de uso do OpenCode (`/workspace/wrk_.../go`) que o painel vai aparecer automaticamente.
+## Usage
 
-## Como usar
+- On page load, the script scans the current page and displays totals
+- Click **Scan all pages** to paginate through the full history
+- Click **Reset** to clear cached data and start fresh
+- Go limits refresh automatically in the background
 
-- Ao entrar na página de uso, o script escaneia a página atual e exibe os totais
-- Clique em **Escanear todas as páginas** para percorrer o histórico completo
-- Clique em **Resetar** para limpar o cache e recomeçar do zero
-- Os limites do Go são atualizados automaticamente de fundo
+## Features
 
-## Funcionalidades
-
-| Funcionalidade | Descrição |
+| Feature | Description |
 |---|---|
-| **Total geral** | Soma de todos os custos em dólar |
-| **Por modelo** | Custo e tokens (in/out) agrupados por modelo de IA |
-| **Por dia** | Gasto agregado por data |
-| **Limites Go** | Barras de progresso de Uso Contínuo, Semanal e Mensal |
-| **Projeção 30 dias** | Calcula se o ritmo atual vai estourar o limite mensal |
-| **Cache** | Dados persistem entre páginas (via GM_setValue) |
-| **Paginação** | Escaneia automaticamente todas as páginas do histórico |
+| **Grand total** | Sum of all costs in USD |
+| **By model** | Cost and tokens (in/out) grouped by AI model |
+| **By day** | Spending aggregated by date |
+| **Go limits** | Live progress bars for Continuous, Weekly, and Monthly usage |
+| **30-day projection** | Estimates if current pace will exceed the monthly cap |
+| **Persistent cache** | Data survives page navigation (via GM_setValue) |
+| **Paginated scanning** | Automatically fetches all history pages |
 
-## Compatibilidade
+## Compatibility
 
-- Funciona em todas as páginas `https://opencode.ai/*`
-- Testado no Chrome, Firefox e Edge com Tampermonkey
-- Pode funcionar em Violentmonkey/Greasemonkey (não testado)
+- Works on all `https://opencode.ai/*` pages
+- Tested on Chrome, Firefox, and Edge with Tampermonkey
+- May work with Violentmonkey/Greasemonkey (not tested)
 
-## Licença
+## License
 
 MIT
