@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.1
+// @version      1.2
 // @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
@@ -24,7 +24,7 @@
     const strings = {
       pt: {
         byModel: "Por modelo",
-        byDay: "Por dia",
+        byDay: "Top dias",
         scanBtn: "Escanear todas as p\u00e1ginas",
         scanningBtn: "Escaneando...",
         resetBtn: "Resetar",
@@ -40,7 +40,7 @@
       },
       en: {
         byModel: "By model",
-        byDay: "By day",
+        byDay: "Top days",
         scanBtn: "Scan all pages",
         scanningBtn: "Scanning...",
         resetBtn: "Reset",
@@ -406,7 +406,7 @@
     createPanel();
 
     const modelEntries = Object.entries(byModel).sort((a, b) => b[1] - a[1]);
-    const dayEntries = Object.entries(byDay).sort((a, b) => b[1] - a[1]);
+    const dayEntries = Object.entries(byDay).sort((a, b) => b[1] - a[1]).slice(0, modelEntries.length);
 
     document.getElementById("oc-grand-total").textContent = `$${total.toFixed(2)}`;
     document.getElementById("oc-meta").textContent =
@@ -584,7 +584,7 @@
 
     return limits
       .map((l) => {
-        let color, extra = "", barPct = l.pct;
+        let color, extra = "";
         const translatedLabel = limitLabels[l.label] || l.label;
 
         if (l.pct < 50) color = "#00d4aa";
@@ -592,26 +592,51 @@
         else color = "#ff6b6b";
 
         const isMonthly = /mensal/i.test(l.label);
+        let barHTML = "";
+
         if (isMonthly && l.pct > 0) {
           const remaining = parseRemainingDays(l.reset);
           const elapsed = Math.max(30 - remaining, 0.5);
+          const idealPct = Math.round((elapsed / 30) * 100);
           const projPct = Math.round((l.pct / elapsed) * 30);
-          if (projPct >= 100) {
-            color = "#ff6b6b";
-            barPct = Math.min(l.pct, 100);
-            extra = `<div style="font-size:10px;color:#ff6b6b;margin-top:2px">
-              ${_("projection", projPct)}
-            </div>`;
+
+          const safePct = Math.min(l.pct, idealPct);
+          const excessPct = Math.max(0, l.pct - idealPct);
+          const grayPct = Math.max(0, idealPct - l.pct);
+
+          let safeColor;
+          if (idealPct < 50) safeColor = "#00d4aa";
+          else if (idealPct < 80) safeColor = "#f0c040";
+          else safeColor = "#ff6b6b";
+
+          const segments = [];
+          if (safePct > 0) {
+            const isOnlySegment = excessPct === 0 && grayPct === 0;
+            segments.push(`<div style="width:${safePct}%;height:100%;background:${safeColor};border-radius:${isOnlySegment ? "3px" : "3px 0 0 3px"};transition:width .3s"></div>`);
           }
+          if (excessPct > 0) {
+            const borderRadius = safePct === 0 ? "3px" : "0 3px 3px 0";
+            segments.push(`<div style="width:${excessPct}%;height:100%;background:#ff6b6b;border-radius:${borderRadius};transition:width .3s"></div>`);
+          }
+          if (grayPct > 0) {
+            const borderRadius = safePct === 0 ? "3px" : "0 3px 3px 0";
+            segments.push(`<div style="width:${grayPct}%;height:100%;background:#555;opacity:0.35;border-radius:${borderRadius};transition:width .3s"></div>`);
+          }
+
+          barHTML = `<div style="background:#333;border-radius:3px;height:6px;overflow:hidden;display:flex">${segments.join("")}</div>`;
+
+          if (projPct >= 100) {
+            extra = `<div style="font-size:10px;color:#ff6b6b;margin-top:2px">${_("projection", projPct)}</div>`;
+          }
+        } else {
+          barHTML = `<div style="background:#333;border-radius:3px;height:6px;overflow:hidden"><div style="width:${l.pct}%;height:100%;background:${color};border-radius:3px;transition:width .3s"></div></div>`;
         }
 
         return `<div style="flex:1;min-width:140px">
           <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
             <span>${translatedLabel}</span><span style="color:${color};font-weight:600">${l.pct}%</span>
           </div>
-          <div style="background:#333;border-radius:3px;height:6px;overflow:hidden">
-            <div style="width:${barPct}%;height:100%;background:${color};border-radius:3px;transition:width .3s"></div>
-          </div>
+          ${barHTML}
           <div style="font-size:10px;color:#666;margin-top:2px">${l.reset}</div>
           ${extra}
         </div>`;
