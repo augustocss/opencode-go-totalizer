@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.2
+// @version      1.3
 // @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
@@ -17,7 +17,11 @@
   const LIMITS_STORAGE_KEY = "oc_go_limits";
   const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
   const PAGINATION_SELECTOR = '[data-slot="pagination"]';
+  const MONTH_PICKER_SELECTOR = '[data-slot="month-picker"]';
+  const MONTH_BUTTON_SELECTOR = '[data-slot="month-button"]';
+  const MONTH_LABEL_SELECTOR = '[data-slot="month-label"]';
   const PAGE_SCAN_DELAY = 1200;
+  let monthOffset = 0;
 
   const locale = (navigator.language || "").startsWith("pt") ? "pt" : "en";
   const _ = (() => {
@@ -35,6 +39,8 @@
         _in: "in",
         _out: "out",
         fallbackLimits: "Limites Go: 5h $12 \u00b7 Semanal $30 \u00b7 Mensal $60",
+        scanningMonth: "Escaneando m\u00eas",
+        billingPeriod: (start, end) => `Per\u00edodo: ${start} \u2014 ${end}`,
         projection: (pct) =>
           `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
       },
@@ -51,6 +57,8 @@
         _in: "in",
         _out: "out",
         fallbackLimits: "Go limits: 5h $12 \u00b7 Weekly $30 \u00b7 Monthly $60",
+        scanningMonth: "Scanning month",
+        billingPeriod: (start, end) => `Period: ${start} \u2014 ${end}`,
         projection: (pct) =>
           `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
       },
@@ -87,7 +95,7 @@
     return span ? parseInt(span.textContent.trim(), 10) || 0 : 0;
   }
 
-  function scanCurrentPage() {
+  function scanCurrentPage(periodo) {
     const table = document.querySelector(TABLE_SELECTOR);
     if (!table) return null;
 
@@ -112,6 +120,11 @@
       const tokensInCell = tds[2];
       const tokensOutCell = tds[3];
       const costCell = tds[4];
+
+      if (periodo) {
+        const rowDate = parseRowDate(dateCell);
+        if (!rowDate || rowDate < periodo.inicio || rowDate > periodo.fim) return;
+      }
 
       const cost = parseCost(costCell.textContent);
       const model = parseModel(modelCell);
@@ -174,7 +187,7 @@
     });
   }
 
-  async function scanAllPages() {
+  async function scanAllPagesRaw(periodo) {
     let grandTotal = 0;
     const grandByModel = {};
     const grandByDay = {};
@@ -188,7 +201,7 @@
 
     while (true) {
       pageNum++;
-      const result = scanCurrentPage();
+      const result = scanCurrentPage(periodo);
       if (!result) break;
 
       const key = `${result.count}-${result.total.toFixed(4)}`;
@@ -224,6 +237,84 @@
       await new Promise((r) => setTimeout(r, PAGE_SCAN_DELAY));
     }
 
+    return { total: grandTotal, byModel: grandByModel, byDay: grandByDay, tokensInByModel: grandTokensInByModel, tokensOutByModel: grandTokensOutByModel, tokensIn: grandTokensIn, tokensOut: grandTokensOut, count: grandCount };
+  }
+
+  async function scanBillingPeriod() {
+    const periodo = calcBillingPeriod();
+    if (!periodo) return scanAllPages();
+
+    const crossesMonth = periodo.inicio.getMonth() !== periodo.fim.getMonth() || periodo.inicio.getFullYear() !== periodo.fim.getFullYear();
+    const originalMonthOffset = monthOffset;
+
+    let grandTotal = 0;
+    const grandByModel = {};
+    const grandByDay = {};
+    const grandTokensInByModel = {};
+    const grandTokensOutByModel = {};
+    let grandTokensIn = 0;
+    let grandTokensOut = 0;
+    let grandCount = 0;
+
+    if (!crossesMonth) {
+      const result = await scanAllPagesRaw(periodo);
+      grandTotal = result.total;
+      Object.assign(grandByModel, result.byModel);
+      Object.assign(grandByDay, result.byDay);
+      Object.assign(grandTokensInByModel, result.tokensInByModel);
+      Object.assign(grandTokensOutByModel, result.tokensOutByModel);
+      grandTokensIn = result.tokensIn;
+      grandTokensOut = result.tokensOut;
+      grandCount = result.count;
+    } else {
+      const startMonth = periodo.inicio.getMonth();
+      const startYear = periodo.inicio.getFullYear();
+
+      // Navegar para o mês mais antigo
+      for (let i = 0; i < 3; i++) {
+        const currentView = getCurrentViewMonth();
+        if (currentView.getMonth() === startMonth && currentView.getFullYear() === startYear) break;
+        if (!clickPrevMonth()) break;
+        await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
+      }
+
+      // Scan do mês antigo
+      const olderResult = await scanAllPagesRaw(periodo);
+      grandTotal += olderResult.total;
+      for (const [m, c] of Object.entries(olderResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
+      for (const [m, t] of Object.entries(olderResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
+      for (const [m, t] of Object.entries(olderResult.tokensOutByModel)) grandTokensOutByModel[m] = (grandTokensOutByModel[m] || 0) + t;
+      for (const [d, c] of Object.entries(olderResult.byDay)) grandByDay[d] = (grandByDay[d] || 0) + c;
+      grandTokensIn += olderResult.tokensIn;
+      grandTokensOut += olderResult.tokensOut;
+      grandCount += olderResult.count;
+
+      // Navegar para o mês mais recente
+      clickNextMonth();
+      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
+
+      // Scan do mês novo
+      const newerResult = await scanAllPagesRaw(periodo);
+      grandTotal += newerResult.total;
+      for (const [m, c] of Object.entries(newerResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
+      for (const [m, t] of Object.entries(newerResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
+      for (const [m, t] of Object.entries(newerResult.tokensOutByModel)) grandTokensOutByModel[m] = (grandTokensOutByModel[m] || 0) + t;
+      for (const [d, c] of Object.entries(newerResult.byDay)) grandByDay[d] = (grandByDay[d] || 0) + c;
+      grandTokensIn += newerResult.tokensIn;
+      grandTokensOut += newerResult.tokensOut;
+      grandCount += newerResult.count;
+    }
+
+    // Voltar ao mês original
+    while (monthOffset !== originalMonthOffset) {
+      if (monthOffset < originalMonthOffset) {
+        if (!clickNextMonth()) break;
+      } else {
+        if (!clickPrevMonth()) break;
+      }
+      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
+    }
+
     const data = {
       total: grandTotal,
       byModel: grandByModel,
@@ -233,13 +324,17 @@
       tokensIn: grandTokensIn,
       tokensOut: grandTokensOut,
       count: grandCount,
+      billingStart: periodo.inicio.toISOString(),
+      billingEnd: periodo.fim.toISOString(),
       timestamp: Date.now(),
     };
 
     GM_setValue(STORAGE_KEY, JSON.stringify(data));
     updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, 0, false);
+  }
 
-    returnToFirstPage();
+  async function scanAllPages() {
+    return scanBillingPeriod();
   }
 
   function returnToFirstPage() {
@@ -442,7 +537,8 @@
 
     document.getElementById("oc-reset-btn").onclick = () => {
       GM_setValue(STORAGE_KEY, "");
-      const r = scanCurrentPage();
+      const periodo = calcBillingPeriod();
+      const r = scanCurrentPage(periodo);
       if (r) {
         updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false);
       }
@@ -473,7 +569,12 @@
       const raw = GM_getValue(STORAGE_KEY, "");
       if (!raw) return null;
       const data = JSON.parse(raw);
-      if (data && typeof data.total === "number") return data;
+      if (data && typeof data.total === "number") {
+        if (data.billingEnd && new Date(data.billingEnd) < new Date()) {
+          return null; // período expirou
+        }
+        return data;
+      }
       return null;
     } catch {
       return null;
@@ -577,6 +678,75 @@
     return days + hours / 24;
   }
 
+  function calcBillingPeriod() {
+    const limits = getCachedLimits();
+    if (!limits) return null;
+    const monthly = limits.find((l) => /mensal/i.test(l.label));
+    if (!monthly) return null;
+
+    const remaining = parseRemainingDays(monthly.reset);
+    const hoje = new Date();
+
+    const dataReset = new Date(hoje);
+    dataReset.setDate(dataReset.getDate() + Math.ceil(remaining));
+    dataReset.setHours(23, 59, 59, 999);
+
+    const periodoInicio = new Date(dataReset);
+    periodoInicio.setDate(periodoInicio.getDate() - 29);
+    periodoInicio.setHours(0, 0, 0, 0);
+
+    return { inicio: periodoInicio, fim: dataReset };
+  }
+
+  function getCurrentViewMonth() {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
+  }
+
+  function parseRowDate(cell) {
+    const title = cell.getAttribute("title") || "";
+    const yearMatch = title.match(/\b(\d{4})\b/);
+    const dayMatch = cell.textContent.trim().match(/^(\d{1,2})\b/);
+    if (!yearMatch || !dayMatch) return null;
+
+    const view = getCurrentViewMonth();
+    return new Date(parseInt(yearMatch[1], 10), view.getMonth(), parseInt(dayMatch[1], 10));
+  }
+
+  function clickPrevMonth() {
+    const buttons = document.querySelectorAll(MONTH_BUTTON_SELECTOR);
+    if (buttons[0] && !buttons[0].disabled) {
+      buttons[0].click();
+      monthOffset--;
+      return true;
+    }
+    return false;
+  }
+
+  function clickNextMonth() {
+    const buttons = document.querySelectorAll(MONTH_BUTTON_SELECTOR);
+    if (buttons[1] && !buttons[1].disabled) {
+      buttons[1].click();
+      monthOffset++;
+      return true;
+    }
+    return false;
+  }
+
+  function waitForMonthChange(previousLabel) {
+    return new Promise((resolve) => {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+        const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
+        if (label !== previousLabel || attempts >= 30) {
+          clearInterval(interval);
+          setTimeout(resolve, 500);
+        }
+      }, 300);
+    });
+  }
+
   function renderLimits(limits) {
     if (!limits || limits.length === 0) {
       return `<span class="oc-limits-info">${_("fallbackLimits")}</span>`;
@@ -666,7 +836,8 @@
 
     if (!isUsagePage()) return;
 
-    const pageResult = scanCurrentPage();
+    const periodo = calcBillingPeriod();
+    const pageResult = scanCurrentPage(periodo);
     if (!pageResult) return;
 
     const stored = loadStoredData();
