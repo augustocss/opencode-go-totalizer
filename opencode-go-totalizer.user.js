@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.3
+// @version      1.4
 // @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
+// @updateURL    https://raw.githubusercontent.com/augustocss/opencode-go-totalizer/main/opencode-go-totalizer.user.js
+// @downloadURL  https://raw.githubusercontent.com/augustocss/opencode-go-totalizer/main/opencode-go-totalizer.user.js
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
