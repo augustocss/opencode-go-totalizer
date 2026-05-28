@@ -240,9 +240,36 @@
     return { total: grandTotal, byModel: grandByModel, byDay: grandByDay, tokensInByModel: grandTokensInByModel, tokensOutByModel: grandTokensOutByModel, tokensIn: grandTokensIn, tokensOut: grandTokensOut, count: grandCount };
   }
 
+  function saveAndDisplay(result, periodo) {
+    const data = {
+      total: result.total,
+      byModel: result.byModel,
+      byDay: result.byDay,
+      tokensInByModel: result.tokensInByModel,
+      tokensOutByModel: result.tokensOutByModel,
+      tokensIn: result.tokensIn,
+      tokensOut: result.tokensOut,
+      count: result.count,
+      billingStart: periodo ? periodo.inicio.toISOString() : undefined,
+      billingEnd: periodo ? periodo.fim.toISOString() : undefined,
+      timestamp: Date.now(),
+    };
+    GM_setValue(STORAGE_KEY, JSON.stringify(data));
+    updatePanel(result.total, result.byModel, result.byDay,
+      result.tokensInByModel, result.tokensOutByModel,
+      result.tokensIn, result.tokensOut, result.count, 0, false);
+  }
+
   async function scanBillingPeriod() {
     const periodo = calcBillingPeriod();
-    if (!periodo) return scanAllPages();
+
+    if (!periodo) {
+      // Fallback: scan sem filtro de período
+      const result = await scanAllPagesRaw(null);
+      saveAndDisplay(result, null);
+      returnToFirstPage();
+      return;
+    }
 
     const crossesMonth = periodo.inicio.getMonth() !== periodo.fim.getMonth() || periodo.inicio.getFullYear() !== periodo.fim.getFullYear();
     const originalMonthOffset = monthOffset;
@@ -315,7 +342,7 @@
       await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
     }
 
-    const data = {
+    saveAndDisplay({
       total: grandTotal,
       byModel: grandByModel,
       byDay: grandByDay,
@@ -323,14 +350,9 @@
       tokensOutByModel: grandTokensOutByModel,
       tokensIn: grandTokensIn,
       tokensOut: grandTokensOut,
-      count: grandCount,
-      billingStart: periodo.inicio.toISOString(),
-      billingEnd: periodo.fim.toISOString(),
-      timestamp: Date.now(),
-    };
-
-    GM_setValue(STORAGE_KEY, JSON.stringify(data));
-    updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, 0, false);
+      count: grandCount
+    }, periodo);
+    returnToFirstPage();
   }
 
   async function scanAllPages() {
@@ -837,7 +859,14 @@
     if (!isUsagePage()) return;
 
     const periodo = calcBillingPeriod();
-    const pageResult = scanCurrentPage(periodo);
+    let pageResult = scanCurrentPage(periodo);
+
+    // Se filtro removiu tudo mas há linhas na tabela, tentar sem filtro
+    if (pageResult && pageResult.count === 0 && periodo) {
+      const unfiltered = scanCurrentPage(null);
+      if (unfiltered && unfiltered.count > 0) pageResult = unfiltered;
+    }
+
     if (!pageResult) return;
 
     const stored = loadStoredData();
