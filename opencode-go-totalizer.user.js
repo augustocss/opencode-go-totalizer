@@ -15,6 +15,7 @@
 
   const STORAGE_KEY = "oc_go_totalizer";
   const LIMITS_STORAGE_KEY = "oc_go_limits";
+  const THEME_KEY = "oc_go_theme";
   const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
   const PAGINATION_SELECTOR = '[data-slot="pagination"]';
   const MONTH_PICKER_SELECTOR = '[data-slot="month-picker"]';
@@ -41,6 +42,7 @@
         fallbackLimits: "Limites Go: 5h $12 \u00b7 Semanal $30 \u00b7 Mensal $60",
         scanningMonth: "Escaneando m\u00eas",
         billingPeriod: (start, end) => `Per\u00edodo: ${start} \u2014 ${end}`,
+        themeToggle: "Alternar tema",
         projection: (pct) =>
           `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
       },
@@ -59,6 +61,7 @@
         fallbackLimits: "Go limits: 5h $12 \u00b7 Weekly $30 \u00b7 Monthly $60",
         scanningMonth: "Scanning month",
         billingPeriod: (start, end) => `Period: ${start} \u2014 ${end}`,
+        themeToggle: "Toggle theme",
         projection: (pct) =>
           `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
       },
@@ -229,7 +232,7 @@
       grandTokensOut += result.tokensOut;
       grandCount += result.count;
 
-      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, pageNum, true);
+      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, pageNum, true, periodo);
 
       if (!hasNextPage()) break;
       clickNextPage();
@@ -257,7 +260,7 @@
     GM_setValue(STORAGE_KEY, JSON.stringify(data));
     updatePanel(result.total, result.byModel, result.byDay,
       result.tokensInByModel, result.tokensOutByModel,
-      result.tokensIn, result.tokensOut, result.count, 0, false);
+      result.tokensIn, result.tokensOut, result.count, 0, false, periodo);
   }
 
   async function scanBillingPeriod() {
@@ -353,6 +356,28 @@
       count: grandCount
     }, periodo);
     returnToFirstPage();
+  }
+
+  function formatDateShort(date) {
+    const d = date.getDate().toString().padStart(2, "0");
+    const m = (date.getMonth() + 1).toString().padStart(2, "0");
+    return locale === "pt" ? `${d}/${m}` : `${m}/${d}`;
+  }
+
+  function getTheme() {
+    return GM_getValue(THEME_KEY, "dark");
+  }
+
+  function setTheme(theme) {
+    GM_setValue(THEME_KEY, theme);
+    applyTheme(theme);
+  }
+
+  function applyTheme(theme) {
+    const panel = document.getElementById("oc-go-totalizer");
+    if (panel) panel.setAttribute("data-theme", theme);
+    const btn = document.getElementById("oc-theme-btn");
+    if (btn) btn.textContent = theme === "dark" ? "\u2600\uFE0F" : "\uD83C\uDF19";
   }
 
   async function scanAllPages() {
@@ -480,16 +505,82 @@
         opacity: 0.6;
         pointer-events: none;
       }
+      #oc-go-totalizer .oc-btn-icon {
+        padding: 4px 8px;
+        font-size: 14px;
+        line-height: 1;
+      }
+      /* Tema claro */
+      #oc-go-totalizer[data-theme="light"] {
+        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+        border-color: #ced4da;
+        color: #212529;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-meta {
+        color: #6c757d;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-breakdown h4 {
+        color: #6c757d;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-limits {
+        border-top-color: #ced4da;
+        color: #6c757d;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-btn {
+        border-color: #0d6efd;
+        color: #0d6efd;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-btn:hover {
+        background: #0d6efd;
+        color: #fff;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-grand-total {
+        color: #0d6efd;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-breakdown-row .oc-cost {
+        color: #0d6efd;
+      }
+      /* Barras de limites */
+      #oc-go-totalizer .oc-bar-bg {
+        background: #333;
+        border-radius: 3px;
+        height: 6px;
+        overflow: hidden;
+        display: flex;
+      }
+      #oc-go-totalizer .oc-bar-green { background: #00d4aa; }
+      #oc-go-totalizer .oc-bar-yellow { background: #f0c040; }
+      #oc-go-totalizer .oc-bar-red { background: #ff6b6b; }
+      #oc-go-totalizer .oc-bar-gray { background: #555; opacity: 0.35; }
+      #oc-go-totalizer .oc-pct-green { color: #00d4aa; }
+      #oc-go-totalizer .oc-pct-yellow { color: #f0c040; }
+      #oc-go-totalizer .oc-pct-red { color: #ff6b6b; }
+      #oc-go-totalizer .oc-reset-text { color: #666; }
+      #oc-go-totalizer .oc-projection-text { color: #ff6b6b; }
+      /* Barras no tema claro */
+      #oc-go-totalizer[data-theme="light"] .oc-bar-bg { background: #ced4da; }
+      #oc-go-totalizer[data-theme="light"] .oc-bar-green { background: #198754; }
+      #oc-go-totalizer[data-theme="light"] .oc-bar-yellow { background: #ffc107; }
+      #oc-go-totalizer[data-theme="light"] .oc-bar-red { background: #dc3545; }
+      #oc-go-totalizer[data-theme="light"] .oc-bar-gray { background: #adb5bd; opacity: 0.5; }
+      #oc-go-totalizer[data-theme="light"] .oc-pct-green { color: #198754; }
+      #oc-go-totalizer[data-theme="light"] .oc-pct-yellow { color: #d97706; }
+      #oc-go-totalizer[data-theme="light"] .oc-pct-red { color: #dc3545; }
+      #oc-go-totalizer[data-theme="light"] .oc-reset-text { color: #6c757d; }
+      #oc-go-totalizer[data-theme="light"] .oc-projection-text { color: #dc3545; }
     `);
 
     const panel = document.createElement("div");
     panel.id = "oc-go-totalizer";
+    panel.setAttribute("data-theme", getTheme());
     panel.innerHTML = `
       <div class="oc-header">
         <div>
           <div class="oc-grand-total" id="oc-grand-total">---</div>
           <div class="oc-meta" id="oc-meta"></div>
         </div>
+        <button class="oc-btn oc-btn-icon" id="oc-theme-btn" title="${_("themeToggle")}">${getTheme() === "dark" ? "\u2600\uFE0F" : "\uD83C\uDF19"}</button>
       </div>
       <div class="oc-breakdowns">
         <div class="oc-breakdown">
@@ -519,16 +610,20 @@
     }
   }
 
-  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning) {
+  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo) {
     createPanel();
 
     const modelEntries = Object.entries(byModel).sort((a, b) => b[1] - a[1]);
     const dayEntries = Object.entries(byDay).sort((a, b) => b[1] - a[1]).slice(0, modelEntries.length);
 
     document.getElementById("oc-grand-total").textContent = `$${total.toFixed(2)}`;
-    document.getElementById("oc-meta").textContent =
-      `${count} ${_("requests")}` + (scanning ? ` | ${_("scanningPage")} ${pageNum}...` : ` | ${_("allPages")}`) +
-      ` | ${_("tokens")}: ${tokensIn.toLocaleString()} ${_("_in")} / ${tokensOut.toLocaleString()} ${_("_out")}`;
+    const metaParts = [];
+    if (periodo) {
+      metaParts.push(_("billingPeriod", formatDateShort(periodo.inicio), formatDateShort(periodo.fim)));
+    }
+    metaParts.push(`${count} ${_("requests")}` + (scanning ? ` | ${_("scanningPage")} ${pageNum}...` : ` | ${_("allPages")}`));
+    metaParts.push(`${_("tokens")}: ${tokensIn.toLocaleString()} ${_("_in")} / ${tokensOut.toLocaleString()} ${_("_out")}`);
+    document.getElementById("oc-meta").textContent = metaParts.join(" | ");
 
     document.getElementById("oc-by-model").innerHTML = modelEntries
       .map(([m, c]) => {
@@ -562,8 +657,14 @@
       const periodo = calcBillingPeriod();
       const r = scanCurrentPage(periodo);
       if (r) {
-        updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false);
+        updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false, periodo);
       }
+    };
+
+    document.getElementById("oc-theme-btn").onclick = () => {
+      const current = getTheme();
+      const next = current === "dark" ? "light" : "dark";
+      setTheme(next);
     };
   }
 
@@ -584,6 +685,16 @@
     });
 
     return limits;
+  }
+
+  function extractResetInSec(doc) {
+    const scripts = doc.querySelectorAll("script:not([src])");
+    for (const s of scripts) {
+      const text = s.textContent;
+      const m = text.match(/monthlyUsage[^}]*resetInSec:\s*(\d+)/);
+      if (m) return parseInt(m[1], 10);
+    }
+    return null;
   }
 
   function loadStoredData() {
@@ -614,7 +725,8 @@
   function captureLimitsFromPage() {
     const limits = parseLimitsFromDoc(document);
     if (limits && limits.length > 0) {
-      GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, ts: Date.now() }));
+      const monthlyResetInSec = extractResetInSec(document);
+      GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, monthlyResetInSec, ts: Date.now() }));
     }
   }
 
@@ -624,6 +736,18 @@
     try {
       const parsed = JSON.parse(raw);
       if (parsed && parsed.limits && parsed.limits.length > 0) return parsed.limits;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getCachedLimitsFull() {
+    const raw = GM_getValue(LIMITS_STORAGE_KEY, "");
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.limits && parsed.limits.length > 0) return parsed;
       return null;
     } catch {
       return null;
@@ -676,7 +800,8 @@
             if (!doc) return;
             const limits = parseLimitsFromDoc(doc);
             if (limits && limits.length > 0) {
-              GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, ts: Date.now() }));
+              const monthlyResetInSec = extractResetInSec(doc);
+              GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, monthlyResetInSec, ts: Date.now() }));
               done(limits);
             } else if (attempts >= 15) {
               done(null);
@@ -693,31 +818,39 @@
   }
 
   function parseRemainingDays(resetText) {
-    const daysMatch = resetText.match(/(\d+)\s*dias?/);
-    const hoursMatch = resetText.match(/(\d+)\s*horas?/);
+    const daysMatch = resetText.match(/(\d+)\s*(?:days?|dias?|tage?|jours?)/i);
+    const hoursMatch = resetText.match(/(\d+)\s*(?:hours?|horas?|stunden?|heures?|hrs?)/i);
     const days = daysMatch ? parseInt(daysMatch[1], 10) : 0;
     const hours = hoursMatch ? parseInt(hoursMatch[1], 10) : 0;
     return days + hours / 24;
   }
 
   function calcBillingPeriod() {
-    const limits = getCachedLimits();
-    if (!limits) return null;
-    const monthly = limits.find((l) => /mensal/i.test(l.label));
+    const cache = getCachedLimitsFull();
+    if (!cache) return null;
+    const monthly = cache.limits.find((l) => /mensal|monthly/i.test(l.label));
     if (!monthly) return null;
 
-    const remaining = parseRemainingDays(monthly.reset);
-    const hoje = new Date();
+    let remainingDays;
+    if (cache.monthlyResetInSec && cache.monthlyResetInSec > 0) {
+      remainingDays = cache.monthlyResetInSec / 86400;
+    } else {
+      remainingDays = parseRemainingDays(monthly.reset);
+    }
 
-    const dataReset = new Date(hoje);
-    dataReset.setDate(dataReset.getDate() + Math.ceil(remaining));
-    dataReset.setHours(23, 59, 59, 999);
+    // Sanity check: se remainingDays for 0, nao e um periodo valido
+    if (!remainingDays || remainingDays <= 0) return null;
 
-    const periodoInicio = new Date(dataReset);
-    periodoInicio.setDate(periodoInicio.getDate() - 29);
-    periodoInicio.setHours(0, 0, 0, 0);
+    // resetMoment = momento exato do reset (= inicio do novo periodo)
+    const resetMoment = new Date(Date.now() + remainingDays * 86400000);
+    // resetDay = primeiro dia do novo periodo
+    const resetDay = new Date(resetMoment.getFullYear(), resetMoment.getMonth(), resetMoment.getDate());
+    // periodoInicio = mesmo dia-do-mes do reset, no mes anterior
+    const periodoInicio = new Date(resetDay.getFullYear(), resetDay.getMonth() - 1, resetDay.getDate(), 0, 0, 0, 0);
+    // periodoFim = ate o inicio do dia do reset (inclui o proprio dia)
+    const periodoFim = resetDay;
 
-    return { inicio: periodoInicio, fim: dataReset };
+    return { inicio: periodoInicio, fim: periodoFim };
   }
 
   function getCurrentViewMonth() {
@@ -776,14 +909,14 @@
 
     return limits
       .map((l) => {
-        let color, extra = "";
+        let colorClass, extra = "";
         const translatedLabel = limitLabels[l.label] || l.label;
 
-        if (l.pct < 50) color = "#00d4aa";
-        else if (l.pct < 80) color = "#f0c040";
-        else color = "#ff6b6b";
+        if (l.pct < 50) colorClass = "oc-pct-green";
+        else if (l.pct < 80) colorClass = "oc-pct-yellow";
+        else colorClass = "oc-pct-red";
 
-        const isMonthly = /mensal/i.test(l.label);
+        const isMonthly = /mensal|monthly/i.test(l.label);
         let barHTML = "";
 
         if (isMonthly && l.pct > 0) {
@@ -796,40 +929,40 @@
           const excessPct = Math.max(0, l.pct - idealPct);
           const grayPct = Math.max(0, idealPct - l.pct);
 
-          let safeColor;
-          if (idealPct < 50) safeColor = "#00d4aa";
-          else if (idealPct < 80) safeColor = "#f0c040";
-          else safeColor = "#ff6b6b";
+          let safeColorClass;
+          if (idealPct < 50) safeColorClass = "oc-bar-green";
+          else if (idealPct < 80) safeColorClass = "oc-bar-yellow";
+          else safeColorClass = "oc-bar-red";
 
           const segments = [];
           if (safePct > 0) {
             const isOnlySegment = excessPct === 0 && grayPct === 0;
-            segments.push(`<div style="width:${safePct}%;height:100%;background:${safeColor};border-radius:${isOnlySegment ? "3px" : "3px 0 0 3px"};transition:width .3s"></div>`);
+            segments.push(`<div style="width:${safePct}%;height:100%;border-radius:${isOnlySegment ? "3px" : "3px 0 0 3px"};transition:width .3s" class="${safeColorClass}"></div>`);
           }
           if (excessPct > 0) {
             const borderRadius = safePct === 0 ? "3px" : "0 3px 3px 0";
-            segments.push(`<div style="width:${excessPct}%;height:100%;background:#ff6b6b;border-radius:${borderRadius};transition:width .3s"></div>`);
+            segments.push(`<div style="width:${excessPct}%;height:100%;border-radius:${borderRadius};transition:width .3s" class="oc-bar-red"></div>`);
           }
           if (grayPct > 0) {
             const borderRadius = safePct === 0 ? "3px" : "0 3px 3px 0";
-            segments.push(`<div style="width:${grayPct}%;height:100%;background:#555;opacity:0.35;border-radius:${borderRadius};transition:width .3s"></div>`);
+            segments.push(`<div style="width:${grayPct}%;height:100%;border-radius:${borderRadius};transition:width .3s" class="oc-bar-gray"></div>`);
           }
 
-          barHTML = `<div style="background:#333;border-radius:3px;height:6px;overflow:hidden;display:flex">${segments.join("")}</div>`;
+          barHTML = `<div class="oc-bar-bg">${segments.join("")}</div>`;
 
           if (projPct >= 100) {
-            extra = `<div style="font-size:10px;color:#ff6b6b;margin-top:2px">${_("projection", projPct)}</div>`;
+            extra = `<div style="font-size:10px;margin-top:2px" class="oc-projection-text">${_("projection", projPct)}</div>`;
           }
         } else {
-          barHTML = `<div style="background:#333;border-radius:3px;height:6px;overflow:hidden"><div style="width:${l.pct}%;height:100%;background:${color};border-radius:3px;transition:width .3s"></div></div>`;
+          barHTML = `<div class="oc-bar-bg"><div style="width:${l.pct}%;height:100%;border-radius:3px;transition:width .3s" class="${colorClass.replace("oc-pct", "oc-bar")}"></div></div>`;
         }
 
         return `<div style="flex:1;min-width:140px">
           <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
-            <span>${translatedLabel}</span><span style="color:${color};font-weight:600">${l.pct}%</span>
+            <span>${translatedLabel}</span><span class="${colorClass}" style="font-weight:600">${l.pct}%</span>
           </div>
           ${barHTML}
-          <div style="font-size:10px;color:#666;margin-top:2px">${l.reset}</div>
+          <div style="font-size:10px;margin-top:2px" class="oc-reset-text">${l.reset}</div>
           ${extra}
         </div>`;
       })
@@ -858,7 +991,7 @@
 
     if (!isUsagePage()) return;
 
-    const periodo = calcBillingPeriod();
+    let periodo = calcBillingPeriod();
     let pageResult = scanCurrentPage(periodo);
 
     // Se filtro removiu tudo mas há linhas na tabela, tentar sem filtro
@@ -876,14 +1009,14 @@
         stored.total, stored.byModel, stored.byDay,
         stored.tokensInByModel || {}, stored.tokensOutByModel || {},
         stored.tokensIn, stored.tokensOut, stored.count,
-        0, false
+        0, false, periodo
       );
     } else {
       updatePanel(
         pageResult.total, pageResult.byModel, pageResult.byDay,
         pageResult.tokensInByModel, pageResult.tokensOutByModel,
         pageResult.tokensIn, pageResult.tokensOut, pageResult.count,
-        1, false
+        1, false, periodo
       );
     }
 
