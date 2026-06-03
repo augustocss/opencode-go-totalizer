@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.4
+// @version      1.5
 // @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
@@ -18,6 +18,8 @@
   const STORAGE_KEY = "oc_go_totalizer";
   const LIMITS_STORAGE_KEY = "oc_go_limits";
   const THEME_KEY = "oc_go_theme";
+  const CACHE_KEY = "oc_go_totalizer_cache_v1";
+  const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
   const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
   const PAGINATION_SELECTOR = '[data-slot="pagination"]';
   const MONTH_PICKER_SELECTOR = '[data-slot="month-picker"]';
@@ -45,6 +47,7 @@
         scanningMonth: "Escaneando m\u00eas",
         billingPeriod: (start, end) => `Per\u00edodo: ${start} \u2014 ${end}`,
         themeToggle: "Alternar tema",
+        clearCache: "Limpar cache",
         projection: (pct) =>
           `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
       },
@@ -64,6 +67,7 @@
         scanningMonth: "Scanning month",
         billingPeriod: (start, end) => `Period: ${start} \u2014 ${end}`,
         themeToggle: "Toggle theme",
+        clearCache: "Clear cache",
         projection: (pct) =>
           `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
       },
@@ -79,6 +83,73 @@
     Semanal: locale === "en" ? "Weekly" : undefined,
     Mensal: locale === "en" ? "Monthly" : undefined,
   };
+
+  function getMonthKey(date) {
+    const d = new Date(date);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function getPeriodKey(periodo) {
+    if (!periodo) return "";
+    const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    return `${fmt(periodo.inicio)}_${fmt(periodo.fim)}`;
+  }
+
+  function loadCache() {
+    try {
+      const raw = GM_getValue(CACHE_KEY, "");
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch { return null; }
+  }
+
+  function saveCache(cache) {
+    GM_setValue(CACHE_KEY, JSON.stringify(cache));
+  }
+
+  function clearCache() {
+    GM_setValue(CACHE_KEY, "");
+  }
+
+  function isCacheValid(cache, periodo) {
+    if (!cache || !cache.months || !periodo) return false;
+    if (cache.version !== 1) return false;
+    if (Date.now() - (cache.savedAt || 0) > CACHE_MAX_AGE_MS) return false;
+    if (getPeriodKey(periodo) !== cache.billingPeriodKey) return false;
+    return true;
+  }
+
+  function mergeResult(target, source) {
+    target.total += source.total || 0;
+    target.tokensIn += source.tokensIn || 0;
+    target.tokensOut += source.tokensOut || 0;
+    target.count += source.count || 0;
+    for (const [k, v] of Object.entries(source.byModel || {})) {
+      target.byModel[k] = (target.byModel[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(source.byDay || {})) {
+      target.byDay[k] = (target.byDay[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(source.tokensInByModel || {})) {
+      target.tokensInByModel[k] = (target.tokensInByModel[k] || 0) + v;
+    }
+    for (const [k, v] of Object.entries(source.tokensOutByModel || {})) {
+      target.tokensOutByModel[k] = (target.tokensOutByModel[k] || 0) + v;
+    }
+  }
+
+  function cloneMonthData(src) {
+    return {
+      total: src.total || 0,
+      byModel: { ...src.byModel },
+      byDay: { ...src.byDay },
+      tokensInByModel: { ...src.tokensInByModel },
+      tokensOutByModel: { ...src.tokensOutByModel },
+      tokensIn: src.tokensIn || 0,
+      tokensOut: src.tokensOut || 0,
+      count: src.count || 0,
+    };
+  }
 
   function parseCost(text) {
     const m = text.match(/Go\s*\(\$([\d.]+)\)/);
@@ -169,30 +240,30 @@
 
   function waitForTableChange() {
     return new Promise((resolve) => {
-      const initialRows = document.querySelectorAll(
-        TABLE_SELECTOR + " tbody tr"
-      ).length;
-      let attempts = 0;
-      const maxAttempts = 30;
-      const interval = setInterval(() => {
-        attempts++;
-        const currentRows = document.querySelectorAll(
-          TABLE_SELECTOR + " tbody tr"
-        ).length;
-        const pag = document.querySelector(PAGINATION_SELECTOR);
-        const nextBtn = pag ? pag.querySelectorAll("button")[1] : null;
-        const nextEnabled = nextBtn && !nextBtn.disabled;
-        const tableChanged = currentRows !== initialRows;
+      const table = document.querySelector(TABLE_SELECTOR);
+      if (!table) { setTimeout(resolve, 400); return; }
+      const tbody = table.querySelector("tbody");
+      if (!tbody) { setTimeout(resolve, 400); return; }
+      const initialHTML = tbody.innerHTML;
+      let resolved = false;
 
-        if ((tableChanged && nextEnabled) || !nextBtn || attempts >= maxAttempts) {
-          clearInterval(interval);
+      const observer = new MutationObserver(() => {
+        if (resolved) return;
+        if (tbody.innerHTML !== initialHTML) {
+          resolved = true;
+          observer.disconnect();
           setTimeout(resolve, 400);
         }
-      }, 200);
+      });
+      observer.observe(tbody, { childList: true, subtree: true });
+
+      setTimeout(() => {
+        if (!resolved) { resolved = true; observer.disconnect(); resolve(); }
+      }, 7000);
     });
   }
 
-  async function scanAllPagesRaw(periodo) {
+  async function scanAllPagesRaw(periodo, monthProgress = "") {
     let grandTotal = 0;
     const grandByModel = {};
     const grandByDay = {};
@@ -234,7 +305,7 @@
       grandTokensOut += result.tokensOut;
       grandCount += result.count;
 
-      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, pageNum, true, periodo);
+      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, pageNum, true, periodo, monthProgress);
 
       if (!hasNextPage()) break;
       clickNextPage();
@@ -269,7 +340,6 @@
     const periodo = calcBillingPeriod();
 
     if (!periodo) {
-      // Fallback: scan sem filtro de período
       const result = await scanAllPagesRaw(null);
       saveAndDisplay(result, null);
       returnToFirstPage();
@@ -288,7 +358,10 @@
     let grandTokensOut = 0;
     let grandCount = 0;
 
+    const cache = loadCache() || { version: 1, months: {} };
+
     if (!crossesMonth) {
+      const singleKey = getMonthKey(periodo.inicio);
       const result = await scanAllPagesRaw(periodo);
       grandTotal = result.total;
       Object.assign(grandByModel, result.byModel);
@@ -298,11 +371,13 @@
       grandTokensIn = result.tokensIn;
       grandTokensOut = result.tokensOut;
       grandCount = result.count;
+      cache.months[singleKey] = cloneMonthData(result);
     } else {
       const startMonth = periodo.inicio.getMonth();
       const startYear = periodo.inicio.getFullYear();
+      const olderKey = getMonthKey(periodo.inicio);
+      const newerKey = getMonthKey(periodo.fim);
 
-      // Navegar para o mês mais antigo
       for (let i = 0; i < 3; i++) {
         const currentView = getCurrentViewMonth();
         if (currentView.getMonth() === startMonth && currentView.getFullYear() === startYear) break;
@@ -310,8 +385,7 @@
         await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
       }
 
-      // Scan do mês antigo
-      const olderResult = await scanAllPagesRaw(periodo);
+      const olderResult = await scanAllPagesRaw(periodo, "M\u00eas 1/2");
       grandTotal += olderResult.total;
       for (const [m, c] of Object.entries(olderResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
       for (const [m, t] of Object.entries(olderResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
@@ -320,13 +394,12 @@
       grandTokensIn += olderResult.tokensIn;
       grandTokensOut += olderResult.tokensOut;
       grandCount += olderResult.count;
+      cache.months[olderKey] = cloneMonthData(olderResult);
 
-      // Navegar para o mês mais recente
       clickNextMonth();
       await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
 
-      // Scan do mês novo
-      const newerResult = await scanAllPagesRaw(periodo);
+      const newerResult = await scanAllPagesRaw(periodo, "M\u00eas 2/2");
       grandTotal += newerResult.total;
       for (const [m, c] of Object.entries(newerResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
       for (const [m, t] of Object.entries(newerResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
@@ -335,17 +408,13 @@
       grandTokensIn += newerResult.tokensIn;
       grandTokensOut += newerResult.tokensOut;
       grandCount += newerResult.count;
+      cache.months[newerKey] = cloneMonthData(newerResult);
     }
 
-    // Voltar ao mês original
-    while (monthOffset !== originalMonthOffset) {
-      if (monthOffset < originalMonthOffset) {
-        if (!clickNextMonth()) break;
-      } else {
-        if (!clickPrevMonth()) break;
-      }
-      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
-    }
+    // Save cache
+    cache.billingPeriodKey = getPeriodKey(periodo);
+    cache.savedAt = Date.now();
+    saveCache(cache);
 
     saveAndDisplay({
       total: grandTotal,
@@ -357,6 +426,17 @@
       tokensOut: grandTokensOut,
       count: grandCount
     }, periodo);
+
+    // Voltar ao mês original
+    while (monthOffset !== originalMonthOffset) {
+      if (monthOffset < originalMonthOffset) {
+        if (!clickNextMonth()) break;
+      } else {
+        if (!clickPrevMonth()) break;
+      }
+      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
+    }
+
     returnToFirstPage();
   }
 
@@ -612,7 +692,7 @@
     }
   }
 
-  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo) {
+  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo, monthLabel = "") {
     createPanel();
 
     const modelEntries = Object.entries(byModel).sort((a, b) => b[1] - a[1]);
@@ -623,7 +703,10 @@
     if (periodo) {
       metaParts.push(_("billingPeriod", formatDateShort(periodo.inicio), formatDateShort(periodo.fim)));
     }
-    metaParts.push(`${count} ${_("requests")}` + (scanning ? ` | ${_("scanningPage")} ${pageNum}...` : ` | ${_("allPages")}`));
+    const progressParts = [];
+    if (monthLabel) progressParts.push(monthLabel);
+    if (scanning) progressParts.push(`${_("scanningPage")} ${pageNum}`);
+    metaParts.push(`${count} ${_("requests")}` + (progressParts.length > 0 ? ` - ${progressParts.join(" - ")}...` : ` | ${_("allPages")}`));
     metaParts.push(`${_("tokens")}: ${tokensIn.toLocaleString()} ${_("_in")} / ${tokensOut.toLocaleString()} ${_("_out")}`);
     document.getElementById("oc-meta").textContent = metaParts.join(" | ");
 
@@ -656,6 +739,7 @@
 
     document.getElementById("oc-reset-btn").onclick = () => {
       GM_setValue(STORAGE_KEY, "");
+      clearCache();
       const periodo = calcBillingPeriod();
       const r = scanCurrentPage(periodo);
       if (r) {
@@ -892,15 +976,24 @@
 
   function waitForMonthChange(previousLabel) {
     return new Promise((resolve) => {
-      let attempts = 0;
-      const interval = setInterval(() => {
-        attempts++;
-        const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
-        if (label !== previousLabel || attempts >= 30) {
-          clearInterval(interval);
-          setTimeout(resolve, 500);
+      const labelEl = document.querySelector(MONTH_LABEL_SELECTOR);
+      if (!labelEl) { setTimeout(resolve, 500); return; }
+      let resolved = false;
+
+      const observer = new MutationObserver(() => {
+        if (resolved) return;
+        const currentLabel = labelEl.textContent?.trim();
+        if (currentLabel && currentLabel !== previousLabel) {
+          resolved = true;
+          observer.disconnect();
+          setTimeout(resolve, 400);
         }
-      }, 300);
+      });
+      observer.observe(labelEl, { childList: true, subtree: true, characterData: true });
+
+      setTimeout(() => {
+        if (!resolved) { resolved = true; observer.disconnect(); resolve(); }
+      }, 7000);
     });
   }
 
@@ -993,10 +1086,9 @@
 
     if (!isUsagePage()) return;
 
-    let periodo = calcBillingPeriod();
+    const periodo = calcBillingPeriod();
     let pageResult = scanCurrentPage(periodo);
 
-    // Se filtro removiu tudo mas há linhas na tabela, tentar sem filtro
     if (pageResult && pageResult.count === 0 && periodo) {
       const unfiltered = scanCurrentPage(null);
       if (unfiltered && unfiltered.count > 0) pageResult = unfiltered;
@@ -1004,23 +1096,39 @@
 
     if (!pageResult) return;
 
-    const stored = loadStoredData();
+    const cache = loadCache();
+    const cacheValid = isCacheValid(cache, periodo);
+    const currentMonthKey = getMonthKey(new Date());
 
-    if (stored) {
-      updatePanel(
-        stored.total, stored.byModel, stored.byDay,
-        stored.tokensInByModel || {}, stored.tokensOutByModel || {},
-        stored.tokensIn, stored.tokensOut, stored.count,
-        0, false, periodo
-      );
-    } else {
-      updatePanel(
-        pageResult.total, pageResult.byModel, pageResult.byDay,
-        pageResult.tokensInByModel, pageResult.tokensOutByModel,
-        pageResult.tokensIn, pageResult.tokensOut, pageResult.count,
-        1, false, periodo
-      );
+    const result = {
+      total: 0,
+      byModel: {},
+      byDay: {},
+      tokensInByModel: {},
+      tokensOutByModel: {},
+      tokensIn: 0,
+      tokensOut: 0,
+      count: 0,
+    };
+
+    // Add cached months (except current)
+    if (cacheValid && cache.months) {
+      for (const [mk, data] of Object.entries(cache.months)) {
+        if (mk !== currentMonthKey) {
+          mergeResult(result, data);
+        }
+      }
     }
+
+    // Add current page (always fresh)
+    mergeResult(result, pageResult);
+
+    updatePanel(
+      result.total, result.byModel, result.byDay,
+      result.tokensInByModel, result.tokensOutByModel,
+      result.tokensIn, result.tokensOut, result.count,
+      0, false, periodo
+    );
 
     refreshPanelLimits();
   }
