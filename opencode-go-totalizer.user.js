@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      1.5
+// @version      2.2
 // @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
 // @author       augustocss
 // @match        https://opencode.ai/*
@@ -20,6 +20,7 @@
   const THEME_KEY = "oc_go_theme";
   const CACHE_KEY = "oc_go_totalizer_cache_v1";
   const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+  const LOG_PREFIX = "[oc-go-totalizer]";
   const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
   const PAGINATION_SELECTOR = '[data-slot="pagination"]';
   const MONTH_PICKER_SELECTOR = '[data-slot="month-picker"]';
@@ -50,6 +51,11 @@
         clearCache: "Limpar cache",
         projection: (pct) =>
           `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
+        waitingLimits: "Aguardando limites Go para calcular o per\u00edodo...",
+        noPeriod: "N\u00e3o foi poss\u00edvel calcular o per\u00edodo. Abra a p\u00e1gina /go e tente de novo.",
+        currentPageOnly: "P\u00e1gina atual (per\u00edodo)",
+        prevPeriod: "Per\u00edodo anterior",
+        prevScanning: (start, end) => `Escaneando per\u00edodo anterior ${start}\u2014${end}...`,
       },
       en: {
         byModel: "By model",
@@ -70,6 +76,11 @@
         clearCache: "Clear cache",
         projection: (pct) =>
           `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
+        waitingLimits: "Waiting for Go limits to compute billing period...",
+        noPeriod: "Could not compute billing period. Open the /go page and try again.",
+        currentPageOnly: "Current page (period)",
+        prevPeriod: "Previous period",
+        prevScanning: (start, end) => `Scanning previous period ${start}\u2014${end}...`,
       },
     };
     const dict = strings[locale] || strings.en;
@@ -263,60 +274,7 @@
     });
   }
 
-  async function scanAllPagesRaw(periodo, monthProgress = "") {
-    let grandTotal = 0;
-    const grandByModel = {};
-    const grandByDay = {};
-    const grandTokensInByModel = {};
-    const grandTokensOutByModel = {};
-    let grandTokensIn = 0;
-    let grandTokensOut = 0;
-    let grandCount = 0;
-    let pageNum = 0;
-    const seen = new Set();
-
-    while (true) {
-      pageNum++;
-      const result = scanCurrentPage(periodo);
-      if (!result) break;
-
-      const key = `${result.count}-${result.total.toFixed(4)}`;
-      if (seen.has(key)) {
-        if (!clickNextPage()) break;
-        await new Promise((r) => setTimeout(r, PAGE_SCAN_DELAY));
-        continue;
-      }
-      seen.add(key);
-
-      grandTotal += result.total;
-      for (const [m, c] of Object.entries(result.byModel)) {
-        grandByModel[m] = (grandByModel[m] || 0) + c;
-      }
-      for (const [m, t] of Object.entries(result.tokensInByModel)) {
-        grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
-      }
-      for (const [m, t] of Object.entries(result.tokensOutByModel)) {
-        grandTokensOutByModel[m] = (grandTokensOutByModel[m] || 0) + t;
-      }
-      for (const [d, c] of Object.entries(result.byDay)) {
-        grandByDay[d] = (grandByDay[d] || 0) + c;
-      }
-      grandTokensIn += result.tokensIn;
-      grandTokensOut += result.tokensOut;
-      grandCount += result.count;
-
-      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel, grandTokensIn, grandTokensOut, grandCount, pageNum, true, periodo, monthProgress);
-
-      if (!hasNextPage()) break;
-      clickNextPage();
-      await waitForTableChange();
-      await new Promise((r) => setTimeout(r, PAGE_SCAN_DELAY));
-    }
-
-    return { total: grandTotal, byModel: grandByModel, byDay: grandByDay, tokensInByModel: grandTokensInByModel, tokensOutByModel: grandTokensOutByModel, tokensIn: grandTokensIn, tokensOut: grandTokensOut, count: grandCount };
-  }
-
-  function saveAndDisplay(result, periodo) {
+  function saveAndDisplay(result, periodo, prevSummary = null) {
     const data = {
       total: result.total,
       byModel: result.byModel,
@@ -328,28 +286,39 @@
       count: result.count,
       billingStart: periodo ? periodo.inicio.toISOString() : undefined,
       billingEnd: periodo ? periodo.fim.toISOString() : undefined,
+      billingPeriodKey: periodo ? getPeriodKey(periodo) : undefined,
+      prevSummary: (prevSummary && periodo && prevSummary.periodo) ? {
+        total: prevSummary.total,
+        count: prevSummary.count,
+        tokensIn: prevSummary.tokensIn,
+        tokensOut: prevSummary.tokensOut,
+        periodKey: prevSummary.periodKey || getPeriodKey(prevSummary.periodo),
+        savedAt: prevSummary.savedAt || Date.now(),
+      } : undefined,
       timestamp: Date.now(),
     };
     GM_setValue(STORAGE_KEY, JSON.stringify(data));
+
+    const prevForPanel = prevSummary && prevSummary.periodo ? prevSummary : null;
     updatePanel(result.total, result.byModel, result.byDay,
       result.tokensInByModel, result.tokensOutByModel,
-      result.tokensIn, result.tokensOut, result.count, 0, false, periodo);
+      result.tokensIn, result.tokensOut, result.count, 0, false, periodo, "", prevForPanel);
   }
 
-  async function scanBillingPeriod() {
-    const periodo = calcBillingPeriod();
+  function emptyResult() {
+    return {
+      total: 0,
+      byModel: {},
+      byDay: {},
+      tokensInByModel: {},
+      tokensOutByModel: {},
+      tokensIn: 0,
+      tokensOut: 0,
+      count: 0,
+    };
+  }
 
-    if (!periodo) {
-      const result = await scanAllPagesRaw(null);
-      saveAndDisplay(result, null);
-      returnToFirstPage();
-      return;
-    }
-
-    const crossesMonth = periodo.inicio.getMonth() !== periodo.fim.getMonth() || periodo.inicio.getFullYear() !== periodo.fim.getFullYear();
-    const originalMonthOffset = monthOffset;
-
-    let grandTotal = 0;
+  async function scanAll(currentPeriodo, prevPeriodo) {
     const grandByModel = {};
     const grandByDay = {};
     const grandTokensInByModel = {};
@@ -358,86 +327,145 @@
     let grandTokensOut = 0;
     let grandCount = 0;
 
+    const prev = { total: 0, count: 0, tokensIn: 0, tokensOut: 0,
+                   byModel: {}, tokensInByModel: {}, tokensOutByModel: {} };
+
     const cache = loadCache() || { version: 1, months: {} };
+    const monthsCache = {};
+    let pageNum = 0;
+    let sawCurrent = false;
+    let sawPrev = false;
+    let emptyPages = 0;
 
-    if (!crossesMonth) {
-      const singleKey = getMonthKey(periodo.inicio);
-      const result = await scanAllPagesRaw(periodo);
-      grandTotal = result.total;
-      Object.assign(grandByModel, result.byModel);
-      Object.assign(grandByDay, result.byDay);
-      Object.assign(grandTokensInByModel, result.tokensInByModel);
-      Object.assign(grandTokensOutByModel, result.tokensOutByModel);
-      grandTokensIn = result.tokensIn;
-      grandTokensOut = result.tokensOut;
-      grandCount = result.count;
-      cache.months[singleKey] = cloneMonthData(result);
-    } else {
-      const startMonth = periodo.inicio.getMonth();
-      const startYear = periodo.inicio.getFullYear();
-      const olderKey = getMonthKey(periodo.inicio);
-      const newerKey = getMonthKey(periodo.fim);
+    console.log(`${LOG_PREFIX}[scanAll] currentPeriodo: ${currentPeriodo.inicio.toISOString()} → ${currentPeriodo.fim.toISOString()}`);
+    if (prevPeriodo) console.log(`${LOG_PREFIX}[scanAll] prevPeriodo: ${prevPeriodo.inicio.toISOString()} → ${prevPeriodo.fim.toISOString()}`);
 
-      for (let i = 0; i < 3; i++) {
-        const currentView = getCurrentViewMonth();
-        if (currentView.getMonth() === startMonth && currentView.getFullYear() === startYear) break;
-        if (!clickPrevMonth()) break;
-        await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
-      }
-
-      const olderResult = await scanAllPagesRaw(periodo, "M\u00eas 1/2");
-      grandTotal += olderResult.total;
-      for (const [m, c] of Object.entries(olderResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
-      for (const [m, t] of Object.entries(olderResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
-      for (const [m, t] of Object.entries(olderResult.tokensOutByModel)) grandTokensOutByModel[m] = (grandTokensOutByModel[m] || 0) + t;
-      for (const [d, c] of Object.entries(olderResult.byDay)) grandByDay[d] = (grandByDay[d] || 0) + c;
-      grandTokensIn += olderResult.tokensIn;
-      grandTokensOut += olderResult.tokensOut;
-      grandCount += olderResult.count;
-      cache.months[olderKey] = cloneMonthData(olderResult);
-
-      clickNextMonth();
+    for (let i = 0; i < 3; i++) {
+      const v = getCurrentViewMonth();
+      if (v.getMonth() === currentPeriodo.inicio.getMonth() && v.getFullYear() === currentPeriodo.inicio.getFullYear()) break;
+      if (!clickPrevMonth()) break;
       await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
-
-      const newerResult = await scanAllPagesRaw(periodo, "M\u00eas 2/2");
-      grandTotal += newerResult.total;
-      for (const [m, c] of Object.entries(newerResult.byModel)) grandByModel[m] = (grandByModel[m] || 0) + c;
-      for (const [m, t] of Object.entries(newerResult.tokensInByModel)) grandTokensInByModel[m] = (grandTokensInByModel[m] || 0) + t;
-      for (const [m, t] of Object.entries(newerResult.tokensOutByModel)) grandTokensOutByModel[m] = (grandTokensOutByModel[m] || 0) + t;
-      for (const [d, c] of Object.entries(newerResult.byDay)) grandByDay[d] = (grandByDay[d] || 0) + c;
-      grandTokensIn += newerResult.tokensIn;
-      grandTokensOut += newerResult.tokensOut;
-      grandCount += newerResult.count;
-      cache.months[newerKey] = cloneMonthData(newerResult);
     }
+    await returnToFirstPage();
+    await new Promise((r) => setTimeout(r, 500));
 
-    // Save cache
-    cache.billingPeriodKey = getPeriodKey(periodo);
-    cache.savedAt = Date.now();
-    saveCache(cache);
+    while (true) {
+      pageNum++;
+      const table = document.querySelector(TABLE_SELECTOR);
+      if (!table) break;
 
-    saveAndDisplay({
-      total: grandTotal,
-      byModel: grandByModel,
-      byDay: grandByDay,
-      tokensInByModel: grandTokensInByModel,
-      tokensOutByModel: grandTokensOutByModel,
-      tokensIn: grandTokensIn,
-      tokensOut: grandTokensOut,
-      count: grandCount
-    }, periodo);
+      const rows = table.querySelectorAll("tbody tr");
+      let currPageCount = 0;
+      let prevPageCount = 0;
 
-    // Voltar ao mês original
-    while (monthOffset !== originalMonthOffset) {
-      if (monthOffset < originalMonthOffset) {
-        if (!clickNextMonth()) break;
+      rows.forEach((tr) => {
+        const tds = tr.querySelectorAll("td");
+        if (tds.length < 5) return;
+        const dateCell = tds[0];
+        const modelCell = tds[1];
+        const tokensInCell = tds[2];
+        const tokensOutCell = tds[3];
+        const costCell = tds[4];
+
+        const rowDate = parseRowDate(dateCell);
+        if (!rowDate) return;
+
+        if (rowDate >= currentPeriodo.inicio && rowDate <= currentPeriodo.fim) {
+          const cost = parseCost(costCell.textContent);
+          const model = parseModel(modelCell);
+          const day = parseDate(dateCell);
+          const tIn = parseTokens(tokensInCell);
+          const tOut = parseTokens(tokensOutCell);
+
+          grandByModel[model] = (grandByModel[model] || 0) + cost;
+          grandByDay[day] = (grandByDay[day] || 0) + cost;
+          grandTokensInByModel[model] = (grandTokensInByModel[model] || 0) + tIn;
+          grandTokensOutByModel[model] = (grandTokensOutByModel[model] || 0) + tOut;
+          grandTokensIn += tIn;
+          grandTokensOut += tOut;
+          grandCount++;
+          currPageCount++;
+
+          const mk = getMonthKey(rowDate);
+          if (!monthsCache[mk]) monthsCache[mk] = { total: 0, byModel: {}, byDay: {}, tokensInByModel: {}, tokensOutByModel: {}, tokensIn: 0, tokensOut: 0, count: 0 };
+          const mc = monthsCache[mk];
+          mc.total += cost; mc.byModel[model] = (mc.byModel[model] || 0) + cost;
+          mc.tokensInByModel[model] = (mc.tokensInByModel[model] || 0) + tIn;
+          mc.tokensOutByModel[model] = (mc.tokensOutByModel[model] || 0) + tOut;
+          mc.byDay[day] = (mc.byDay[day] || 0) + cost;
+          mc.tokensIn += tIn; mc.tokensOut += tOut; mc.count++;
+          sawCurrent = true;
+        } else if (prevPeriodo && rowDate >= prevPeriodo.inicio && rowDate <= prevPeriodo.fim) {
+          const cost = parseCost(costCell.textContent);
+          const model = parseModel(modelCell);
+          const tIn = parseTokens(tokensInCell);
+          const tOut = parseTokens(tokensOutCell);
+
+          prev.total += cost;
+          prev.tokensIn += tIn;
+          prev.tokensOut += tOut;
+          prev.count++;
+          prev.byModel[model] = (prev.byModel[model] || 0) + cost;
+          prev.tokensInByModel[model] = (prev.tokensInByModel[model] || 0) + tIn;
+          prev.tokensOutByModel[model] = (prev.tokensOutByModel[model] || 0) + tOut;
+          prevPageCount++;
+
+          const mk = getMonthKey(rowDate);
+          if (!monthsCache[mk]) monthsCache[mk] = { total: 0, byModel: {}, byDay: {}, tokensInByModel: {}, tokensOutByModel: {}, tokensIn: 0, tokensOut: 0, count: 0 };
+          const mc = monthsCache[mk];
+          mc.total += cost; mc.byModel[model] = (mc.byModel[model] || 0) + cost;
+          mc.tokensInByModel[model] = (mc.tokensInByModel[model] || 0) + tIn;
+          mc.tokensOutByModel[model] = (mc.tokensOutByModel[model] || 0) + tOut;
+          mc.tokensIn += tIn; mc.tokensOut += tOut; mc.count++;
+          sawPrev = true;
+        }
+      });
+
+      const grandTotal = Object.values(grandByModel).reduce((s, v) => s + v, 0);
+      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel,
+        grandTokensIn, grandTokensOut, grandCount, pageNum, true, currentPeriodo);
+
+      if (currPageCount === 0 && prevPageCount === 0) {
+        emptyPages++;
+        if (sawCurrent && sawPrev && emptyPages >= 2) {
+          console.log(`${LOG_PREFIX}[scanAll] early stop: ${emptyPages} empty pages after finding both periods`);
+          break;
+        }
       } else {
-        if (!clickPrevMonth()) break;
+        emptyPages = 0;
       }
-      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
+
+      if (!hasNextPage()) { console.log(`${LOG_PREFIX}[scanAll] no more pages`); break; }
+      clickNextPage();
+      await waitForTableChange();
+      await new Promise((r) => setTimeout(r, PAGE_SCAN_DELAY));
     }
 
-    returnToFirstPage();
+    for (const [mk, mc] of Object.entries(monthsCache)) cache.months[mk] = mc;
+    cache.billingPeriodKey = getPeriodKey(currentPeriodo);
+    cache.savedAt = Date.now();
+
+    let prevSummary = null;
+    if (prevPeriodo) {
+      const prevKey = getPeriodKey(prevPeriodo);
+      if (prev.count > 0 || prev.total > 0) {
+        prevSummary = { ...prev, periodo: prevPeriodo, periodKey: prevKey, savedAt: Date.now() };
+        cache.prevSummary = { total: prev.total, count: prev.count, tokensIn: prev.tokensIn, tokensOut: prev.tokensOut, periodKey: prevKey, savedAt: Date.now() };
+        console.log(`${LOG_PREFIX}[scanAll] prev TOTAL: $${prev.total.toFixed(4)} (${prev.count} reqs)`);
+      }
+    }
+
+    saveCache(cache);
+    const grandTotal = Object.values(grandByModel).reduce((s, v) => s + v, 0);
+    saveAndDisplay({
+      total: grandTotal, byModel: grandByModel, byDay: grandByDay,
+      tokensInByModel: grandTokensInByModel, tokensOutByModel: grandTokensOutByModel,
+      tokensIn: grandTokensIn, tokensOut: grandTokensOut, count: grandCount
+    }, currentPeriodo, prevSummary);
+
+    syncMonthOffsetFromLabel();
+    await returnToFirstPage();
+    console.log(`${LOG_PREFIX}[scanAll] done`);
   }
 
   function formatDateShort(date) {
@@ -463,24 +491,27 @@
   }
 
   async function scanAllPages() {
-    return scanBillingPeriod();
+    const currentPeriodo = await ensureBillingPeriod();
+    if (!currentPeriodo) {
+      updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, null);
+      const meta = document.getElementById("oc-meta");
+      if (meta) meta.textContent = _("noPeriod");
+      return;
+    }
+    const prevPeriodo = calcPrevBillingPeriod(currentPeriodo);
+    await scanAll(currentPeriodo, prevPeriodo);
   }
 
-  function returnToFirstPage() {
+  async function returnToFirstPage() {
     const pag = document.querySelector(PAGINATION_SELECTOR);
     if (!pag) return;
-    const buttons = pag.querySelectorAll("button");
-    if (buttons.length > 0) {
-      let maxClicks = 50;
-      const clickPrev = () => {
-        if (maxClicks-- <= 0) return;
-        const prevBtn = pag.querySelectorAll("button")[0];
-        if (prevBtn && !prevBtn.disabled) {
-          prevBtn.click();
-          setTimeout(clickPrev, 600);
-        }
-      };
-      clickPrev();
+    for (let i = 0; i < 50; i++) {
+      const btns = pag.querySelectorAll("button");
+      const prev = btns[0];
+      if (!prev || prev.disabled) break;
+      prev.click();
+      await waitForTableChange();
+      await new Promise((r) => setTimeout(r, 300));
     }
   }
 
@@ -525,6 +556,44 @@
       #oc-go-totalizer .oc-meta {
         color: #888;
         font-size: 12px;
+      }
+      #oc-go-totalizer .oc-prev-period {
+        margin-bottom: 10px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.04);
+        display: none;
+      }
+      #oc-go-totalizer .oc-prev-period.show { display: block; }
+      #oc-go-totalizer .oc-prev-period .oc-prev-label {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: #888;
+        margin-bottom: 2px;
+      }
+      #oc-go-totalizer .oc-prev-period .oc-prev-line {
+        font-size: 12px;
+      }
+      #oc-go-totalizer .oc-prev-period .oc-prev-cost {
+        color: #00d4aa;
+        font-weight: 600;
+      }
+      #oc-go-totalizer .oc-prev-period .oc-prev-sep {
+        color: #555;
+        margin: 0 6px;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-prev-period {
+        background: rgba(0, 0, 0, 0.04);
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-prev-period .oc-prev-label {
+        color: #6c757d;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-prev-period .oc-prev-cost {
+        color: #0d6efd;
+      }
+      #oc-go-totalizer[data-theme="light"] .oc-prev-period .oc-prev-sep {
+        color: #ced4da;
       }
       #oc-go-totalizer .oc-breakdowns {
         display: flex;
@@ -664,6 +733,7 @@
         </div>
         <button class="oc-btn oc-btn-icon" id="oc-theme-btn" title="${_("themeToggle")}">${getTheme() === "dark" ? "\u2600\uFE0F" : "\uD83C\uDF19"}</button>
       </div>
+      <div class="oc-prev-period" id="oc-prev-period"></div>
       <div class="oc-breakdowns">
         <div class="oc-breakdown">
           <h4>${_("byModel")}</h4>
@@ -692,8 +762,24 @@
     }
   }
 
-  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo, monthLabel = "") {
+  function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo, monthLabel = "", prevSummary = null) {
     createPanel();
+
+    const prevEl = document.getElementById("oc-prev-period");
+    if (prevEl) {
+      if (prevSummary && typeof prevSummary.total === "number") {
+        const prevPeriodo = prevSummary.periodo || calcPrevBillingPeriod(periodo);
+        const periodTxt = prevPeriodo ? `${formatDateShort(prevPeriodo.inicio)} \u2014 ${formatDateShort(prevPeriodo.fim)}` : "";
+        const line = `<span class="oc-prev-cost">$${prevSummary.total.toFixed(2)}</span>`
+          + `<span class="oc-prev-sep">\u00b7</span>${prevSummary.count.toLocaleString()} ${_("requests")}`
+          + `<span class="oc-prev-sep">\u00b7</span>${prevSummary.tokensIn.toLocaleString()} ${_("_in")} / ${prevSummary.tokensOut.toLocaleString()} ${_("_out")}`;
+        prevEl.innerHTML = `<div class="oc-prev-label">${_("prevPeriod")}: ${periodTxt}</div><div class="oc-prev-line">${line}</div>`;
+        prevEl.classList.add("show");
+      } else {
+        prevEl.innerHTML = "";
+        prevEl.classList.remove("show");
+      }
+    }
 
     const modelEntries = Object.entries(byModel).sort((a, b) => b[1] - a[1]);
     const dayEntries = Object.entries(byDay).sort((a, b) => b[1] - a[1]).slice(0, modelEntries.length);
@@ -706,7 +792,11 @@
     const progressParts = [];
     if (monthLabel) progressParts.push(monthLabel);
     if (scanning) progressParts.push(`${_("scanningPage")} ${pageNum}`);
-    metaParts.push(`${count} ${_("requests")}` + (progressParts.length > 0 ? ` - ${progressParts.join(" - ")}...` : ` | ${_("allPages")}`));
+    if (progressParts.length > 0) {
+      metaParts.push(`${count} ${_("requests")} - ${progressParts.join(" - ")}...`);
+    } else {
+      metaParts.push(`${count} ${_("requests")} | ${_("allPages")}`);
+    }
     metaParts.push(`${_("tokens")}: ${tokensIn.toLocaleString()} ${_("_in")} / ${tokensOut.toLocaleString()} ${_("_out")}`);
     document.getElementById("oc-meta").textContent = metaParts.join(" | ");
 
@@ -737,14 +827,17 @@
       });
     };
 
-    document.getElementById("oc-reset-btn").onclick = () => {
+    document.getElementById("oc-reset-btn").onclick = async () => {
       GM_setValue(STORAGE_KEY, "");
       clearCache();
-      const periodo = calcBillingPeriod();
-      const r = scanCurrentPage(periodo);
-      if (r) {
-        updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false, periodo);
+      const periodo = await ensureBillingPeriod();
+      if (!periodo) {
+        const meta = document.getElementById("oc-meta");
+        if (meta) meta.textContent = _("noPeriod");
+        return;
       }
+      const r = scanCurrentPage(periodo) || emptyResult();
+      updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false, periodo);
     };
 
     document.getElementById("oc-theme-btn").onclick = () => {
@@ -783,18 +876,30 @@
     return null;
   }
 
-  function loadStoredData() {
+  function loadStoredData(periodo) {
     try {
       const raw = GM_getValue(STORAGE_KEY, "");
       if (!raw) return null;
       const data = JSON.parse(raw);
-      if (data && typeof data.total === "number") {
-        if (data.billingEnd && new Date(data.billingEnd) < new Date()) {
-          return null; // período expirou
-        }
-        return data;
+      if (!data || typeof data.total !== "number") return null;
+      if (data.billingEnd && new Date(data.billingEnd) < new Date()) {
+        return null;
       }
-      return null;
+      if (periodo) {
+        const currentKey = getPeriodKey(periodo);
+        if (data.billingPeriodKey) {
+          if (data.billingPeriodKey !== currentKey) return null;
+        } else if (data.billingStart && data.billingEnd) {
+          // legacy: compare local calendar days from stored ISO
+          const s = new Date(data.billingStart);
+          const e = new Date(data.billingEnd);
+          const legacyKey = getPeriodKey({ inicio: s, fim: e });
+          if (legacyKey !== currentKey) return null;
+        } else {
+          return null;
+        }
+      }
+      return data;
     } catch {
       return null;
     }
@@ -917,41 +1022,122 @@
     const monthly = cache.limits.find((l) => /mensal|monthly/i.test(l.label));
     if (!monthly) return null;
 
-    let remainingDays;
+    let remainingDays = 0;
+    const ts = cache.ts || Date.now();
+    const elapsedSec = Math.max(0, (Date.now() - ts) / 1000);
+
     if (cache.monthlyResetInSec && cache.monthlyResetInSec > 0) {
-      remainingDays = cache.monthlyResetInSec / 86400;
-    } else {
+      remainingDays = (cache.monthlyResetInSec - elapsedSec) / 86400;
+    }
+    if (!remainingDays || remainingDays <= 0) {
       remainingDays = parseRemainingDays(monthly.reset);
     }
 
-    // Sanity check: se remainingDays for 0, nao e um periodo valido
     if (!remainingDays || remainingDays <= 0) return null;
 
-    // resetMoment = momento exato do reset (= inicio do novo periodo)
     const resetMoment = new Date(Date.now() + remainingDays * 86400000);
-    // resetDay = primeiro dia do novo periodo
     const resetDay = new Date(resetMoment.getFullYear(), resetMoment.getMonth(), resetMoment.getDate());
-    // periodoInicio = mesmo dia-do-mes do reset, no mes anterior
     const periodoInicio = new Date(resetDay.getFullYear(), resetDay.getMonth() - 1, resetDay.getDate(), 0, 0, 0, 0);
-    // periodoFim = ate o inicio do dia do reset (inclui o proprio dia)
-    const periodoFim = resetDay;
+    const periodoFim = new Date(resetDay.getFullYear(), resetDay.getMonth(), resetDay.getDate(), 23, 59, 59, 999);
 
     return { inicio: periodoInicio, fim: periodoFim };
   }
 
+  async function ensureBillingPeriod() {
+    let periodo = calcBillingPeriod();
+    if (periodo) return periodo;
+    await fetchGoLimits();
+    return calcBillingPeriod();
+  }
+
+  function calcPrevBillingPeriod(periodo) {
+    if (!periodo) return null;
+    const prevInicio = new Date(periodo.inicio.getFullYear(), periodo.inicio.getMonth() - 1, periodo.inicio.getDate(), 0, 0, 0, 0);
+    const prevFimMs = new Date(periodo.inicio.getFullYear(), periodo.inicio.getMonth(), periodo.inicio.getDate(), 0, 0, 0, 0).getTime() - 1;
+    return { inicio: prevInicio, fim: new Date(prevFimMs) };
+  }
+
+  const MONTH_NAME_MAP = {
+    jan: 0, january: 0, janeiro: 0,
+    fev: 1, feb: 1, february: 1, fevereiro: 1,
+    mar: 2, march: 2, marco: 2, "março": 2,
+    abr: 3, apr: 3, april: 3, abril: 3,
+    mai: 4, may: 4, maio: 4,
+    jun: 5, june: 5, junho: 5,
+    jul: 6, july: 6, julho: 6,
+    ago: 7, aug: 7, august: 7, agosto: 7,
+    set: 8, sep: 8, sept: 8, september: 8, setembro: 8,
+    out: 9, oct: 9, october: 9, outubro: 9,
+    nov: 10, november: 10, novembro: 10,
+    dez: 11, dec: 11, december: 11, dezembro: 11,
+  };
+
+  function parseMonthLabel(text) {
+    if (!text) return null;
+    const t = text.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const yearMatch = t.match(/\b(20\d{2})\b/);
+    const year = yearMatch ? parseInt(yearMatch[1], 10) : new Date().getFullYear();
+    for (const [name, idx] of Object.entries(MONTH_NAME_MAP)) {
+      const n = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      if (t.includes(n)) return new Date(year, idx, 1);
+    }
+    const numMatch = t.match(/\b(1[0-2]|0?[1-9])\b/);
+    if (numMatch) return new Date(year, parseInt(numMatch[1], 10) - 1, 1);
+    return null;
+  }
+
+  function syncMonthOffsetFromLabel() {
+    const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
+    const viewed = parseMonthLabel(label);
+    if (!viewed) return;
+    const now = new Date();
+    monthOffset = (viewed.getFullYear() - now.getFullYear()) * 12 + (viewed.getMonth() - now.getMonth());
+  }
+
   function getCurrentViewMonth() {
+    const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
+    const fromLabel = parseMonthLabel(label);
+    if (fromLabel) return fromLabel;
     const now = new Date();
     return new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
   }
 
   function parseRowDate(cell) {
-    const title = cell.getAttribute("title") || "";
-    const yearMatch = title.match(/\b(\d{4})\b/);
-    const dayMatch = cell.textContent.trim().match(/^(\d{1,2})\b/);
-    if (!yearMatch || !dayMatch) return null;
-
+    const title = (cell.getAttribute("title") || "").trim();
+    const text = cell.textContent.trim();
     const view = getCurrentViewMonth();
-    return new Date(parseInt(yearMatch[1], 10), view.getMonth(), parseInt(dayMatch[1], 10));
+
+    // ISO-like: 2026-07-18 or 2026/07/18
+    let m = title.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
+    if (m) return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+
+    // EN: Jul 18, 2026 / July 18 2026
+    m = title.match(/\b([A-Za-zçÇãÃéÉôÔ.]+)\s+(\d{1,2})(?:,)?\s+(20\d{2})\b/);
+    if (m) {
+      const mon = parseMonthLabel(m[1] + " " + m[3]);
+      if (mon) return new Date(mon.getFullYear(), mon.getMonth(), parseInt(m[2], 10));
+    }
+
+    // PT: 18 de jul. de 2026 / 18 de julho de 2026
+    m = title.match(/\b(\d{1,2})\s+de\s+([A-Za-zçÇãÃéÉôÔ.]+)(?:\s+de)?\s+(20\d{2})\b/i);
+    if (m) {
+      const mon = parseMonthLabel(m[2] + " " + m[3]);
+      if (mon) return new Date(mon.getFullYear(), mon.getMonth(), parseInt(m[1], 10));
+    }
+
+    // PT short in title: 18 de jul.
+    m = title.match(/\b(\d{1,2})\s+de\s+([A-Za-zçÇãÃéÉôÔ.]+)/i);
+    if (m) {
+      const mon = parseMonthLabel(m[2] + " " + view.getFullYear());
+      if (mon) return new Date(view.getFullYear(), mon.getMonth(), parseInt(m[1], 10));
+    }
+
+    const yearMatch = title.match(/\b(20\d{2})\b/);
+    const dayMatch = text.match(/(\d{1,2})/);
+    if (!dayMatch) return null;
+
+    const year = yearMatch ? parseInt(yearMatch[1], 10) : view.getFullYear();
+    return new Date(year, view.getMonth(), parseInt(dayMatch[1], 10));
   }
 
   function clickPrevMonth() {
@@ -1077,7 +1263,7 @@
     }
   }
 
-  function init() {
+  async function init() {
     if (isGoPage()) {
       captureLimitsFromPage();
       setInterval(captureLimitsFromPage, 10000);
@@ -1086,32 +1272,55 @@
 
     if (!isUsagePage()) return;
 
-    const periodo = calcBillingPeriod();
-    let pageResult = scanCurrentPage(periodo);
+    syncMonthOffsetFromLabel();
+    createPanel();
+    const metaEl = document.getElementById("oc-meta");
+    if (metaEl) metaEl.textContent = _("waitingLimits");
 
-    if (pageResult && pageResult.count === 0 && periodo) {
-      const unfiltered = scanCurrentPage(null);
-      if (unfiltered && unfiltered.count > 0) pageResult = unfiltered;
+    const periodo = await ensureBillingPeriod();
+    if (!periodo) {
+      updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, null);
+      const meta = document.getElementById("oc-meta");
+      if (meta) meta.textContent = _("noPeriod");
+      refreshPanelLimits();
+      return;
     }
 
-    if (!pageResult) return;
+    const stored = loadStoredData(periodo);
+    if (stored) {
+      const prevSummaryForPanel = hydratePrevSummary(periodo, stored);
+      updatePanel(
+        stored.total,
+        stored.byModel || {},
+        stored.byDay || {},
+        stored.tokensInByModel || {},
+        stored.tokensOutByModel || {},
+        stored.tokensIn || 0,
+        stored.tokensOut || 0,
+        stored.count || 0,
+        0,
+        false,
+        periodo,
+        "",
+        prevSummaryForPanel
+      );
+      refreshPanelLimits();
+      return;
+    }
+
+    const pageResult = scanCurrentPage(periodo);
+    if (!pageResult) {
+      const prevSummaryForPanel = hydratePrevSummary(periodo, null);
+      updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, periodo, "", prevSummaryForPanel);
+      refreshPanelLimits();
+      return;
+    }
 
     const cache = loadCache();
     const cacheValid = isCacheValid(cache, periodo);
     const currentMonthKey = getMonthKey(new Date());
+    const result = emptyResult();
 
-    const result = {
-      total: 0,
-      byModel: {},
-      byDay: {},
-      tokensInByModel: {},
-      tokensOutByModel: {},
-      tokensIn: 0,
-      tokensOut: 0,
-      count: 0,
-    };
-
-    // Add cached months (except current)
     if (cacheValid && cache.months) {
       for (const [mk, data] of Object.entries(cache.months)) {
         if (mk !== currentMonthKey) {
@@ -1120,17 +1329,49 @@
       }
     }
 
-    // Add current page (always fresh)
     mergeResult(result, pageResult);
 
+    const prevSummaryForPanel = hydratePrevSummary(periodo, null);
     updatePanel(
       result.total, result.byModel, result.byDay,
       result.tokensInByModel, result.tokensOutByModel,
       result.tokensIn, result.tokensOut, result.count,
-      0, false, periodo
+      0, false, periodo, "", prevSummaryForPanel
     );
 
     refreshPanelLimits();
+  }
+
+  function hydratePrevSummary(periodo, stored) {
+    const prevPeriodo = calcPrevBillingPeriod(periodo);
+    if (!prevPeriodo) return null;
+    const prevKey = getPeriodKey(prevPeriodo);
+
+    const usable = (s) => s && s.periodKey === prevKey && !s.skipped && (s.count > 0 || s.total > 0);
+
+    if (stored && usable(stored.prevSummary)) {
+      return {
+        total: stored.prevSummary.total,
+        count: stored.prevSummary.count,
+        tokensIn: stored.prevSummary.tokensIn,
+        tokensOut: stored.prevSummary.tokensOut,
+        periodo: prevPeriodo,
+      };
+    }
+
+    const cache = loadCache();
+    if (cache && usable(cache.prevSummary) &&
+        (Date.now() - (cache.prevSummary.savedAt || 0)) < CACHE_MAX_AGE_MS) {
+      return {
+        total: cache.prevSummary.total,
+        count: cache.prevSummary.count,
+        tokensIn: cache.prevSummary.tokensIn,
+        tokensOut: cache.prevSummary.tokensOut,
+        periodo: prevPeriodo,
+      };
+    }
+
+    return null;
   }
 
   if (document.readyState === "loading") {
