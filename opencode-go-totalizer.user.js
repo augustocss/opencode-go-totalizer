@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         OpenCode Go Usage Totalizer
 // @namespace    https://github.com/augustocss/opencode-go-totalizer
-// @version      2.2
-// @description  Aggregate cost/token usage from the OpenCode Go table with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go.
+// @version      3.0
+// @description  Aggregate cost/token usage from the OpenCode request-logs API with breakdowns by model/day and real-time Go limit tracking. / Totalizador de credito/uso do OpenCode Go via API de logs.
 // @author       augustocss
 // @match        https://opencode.ai/*
 // @updateURL    https://raw.githubusercontent.com/augustocss/opencode-go-totalizer/main/opencode-go-totalizer.user.js
@@ -21,13 +21,15 @@
   const CACHE_KEY = "oc_go_totalizer_cache_v1";
   const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
   const LOG_PREFIX = "[oc-go-totalizer]";
-  const TABLE_SELECTOR = '[data-slot="usage-table-element"]';
-  const PAGINATION_SELECTOR = '[data-slot="pagination"]';
-  const MONTH_PICKER_SELECTOR = '[data-slot="month-picker"]';
-  const MONTH_BUTTON_SELECTOR = '[data-slot="month-button"]';
-  const MONTH_LABEL_SELECTOR = '[data-slot="month-label"]';
-  const PAGE_SCAN_DELAY = 1200;
-  let monthOffset = 0;
+  const LOGS_API_PATH = "/console/api/request-logs";
+  const API_PAGE_LIMIT = 50;
+  const API_WINDOW_CHUNK_MS = 6 * 24 * 60 * 60 * 1000;
+  const API_FLOOR_SAFETY_MS = 60 * 60 * 1000;
+  const API_PAGE_DELAY = 120;
+  const API_MAX_RETRIES = 3;
+  const API_RETRY_BASE_MS = 2000;
+  const RETENTION_DAYS = 30;
+  const ORG_KEY = "oc_go_org_id";
 
   const locale = (navigator.language || "").startsWith("pt") ? "pt" : "en";
   const _ = (() => {
@@ -35,17 +37,16 @@
       pt: {
         byModel: "Por modelo",
         byDay: "Top dias",
-        scanBtn: "Escanear todas as p\u00e1ginas",
-        scanningBtn: "Escaneando...",
+        scanBtn: "Atualizar totais",
+        scanningBtn: "Atualizando...",
         resetBtn: "Resetar",
         requests: "requisi\u00e7\u00f5es",
-        scanningPage: "Escaneando p\u00e1gina",
-        allPages: "Todas as p\u00e1ginas",
+        scanningPage: "P\u00e1gina",
+        allPages: "todas as p\u00e1ginas",
         tokens: "Tokens",
         _in: "in",
         _out: "out",
         fallbackLimits: "Limites Go: 5h $12 \u00b7 Semanal $30 \u00b7 Mensal $60",
-        scanningMonth: "Escaneando m\u00eas",
         billingPeriod: (start, end) => `Per\u00edodo: ${start} \u2014 ${end}`,
         themeToggle: "Alternar tema",
         clearCache: "Limpar cache",
@@ -53,24 +54,24 @@
           `Proje\u00e7\u00e3o: ${pct}% no fim do m\u00eas \u2014 vai estourar o limite no ritmo atual`,
         waitingLimits: "Aguardando limites Go para calcular o per\u00edodo...",
         noPeriod: "N\u00e3o foi poss\u00edvel calcular o per\u00edodo. Abra a p\u00e1gina /go e tente de novo.",
-        currentPageOnly: "P\u00e1gina atual (per\u00edodo)",
         prevPeriod: "Per\u00edodo anterior",
-        prevScanning: (start, end) => `Escaneando per\u00edodo anterior ${start}\u2014${end}...`,
+        partial: "parcial (reten\u00e7\u00e3o de 30 dias)",
+        noPrevData: "sem logs dispon\u00edveis (reten\u00e7\u00e3o do servidor)",
+        apiError: "Falha ao consultar a API de logs. Recarregue a p\u00e1gina e tente de novo.",
       },
       en: {
         byModel: "By model",
         byDay: "Top days",
-        scanBtn: "Scan all pages",
-        scanningBtn: "Scanning...",
+        scanBtn: "Refresh totals",
+        scanningBtn: "Refreshing...",
         resetBtn: "Reset",
         requests: "requests",
-        scanningPage: "Scanning page",
-        allPages: "All pages",
+        scanningPage: "Page",
+        allPages: "all pages",
         tokens: "Tokens",
         _in: "in",
         _out: "out",
         fallbackLimits: "Go limits: 5h $12 \u00b7 Weekly $30 \u00b7 Monthly $60",
-        scanningMonth: "Scanning month",
         billingPeriod: (start, end) => `Period: ${start} \u2014 ${end}`,
         themeToggle: "Toggle theme",
         clearCache: "Clear cache",
@@ -78,9 +79,10 @@
           `Projection: ${pct}% at month end \u2014 will exceed limit at current pace`,
         waitingLimits: "Waiting for Go limits to compute billing period...",
         noPeriod: "Could not compute billing period. Open the /go page and try again.",
-        currentPageOnly: "Current page (period)",
         prevPeriod: "Previous period",
-        prevScanning: (start, end) => `Scanning previous period ${start}\u2014${end}...`,
+        partial: "partial (30-day retention)",
+        noPrevData: "no logs available (server retention)",
+        apiError: "Request-logs API failed. Reload the page and try again.",
       },
     };
     const dict = strings[locale] || strings.en;
@@ -89,10 +91,9 @@
       return typeof val === "function" ? val(...args) : val;
     };
   })();
-  const limitLabels = {
-    "Uso Cont\u00ednuo": locale === "en" ? "Continuous Usage" : undefined,
-    Semanal: locale === "en" ? "Weekly" : undefined,
-    Mensal: locale === "en" ? "Monthly" : undefined,
+  const LIMIT_LABEL_I18N = {
+    pt: { Rolling: "Uso cont\u00ednuo", Weekly: "Semanal", Monthly: "Mensal" },
+    en: { Rolling: "Continuous", Weekly: "Weekly", Monthly: "Monthly" },
   };
 
   function getMonthKey(date) {
@@ -122,156 +123,148 @@
     GM_setValue(CACHE_KEY, "");
   }
 
-  function isCacheValid(cache, periodo) {
-    if (!cache || !cache.months || !periodo) return false;
-    if (cache.version !== 1) return false;
-    if (Date.now() - (cache.savedAt || 0) > CACHE_MAX_AGE_MS) return false;
-    if (getPeriodKey(periodo) !== cache.billingPeriodKey) return false;
-    return true;
-  }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  function mergeResult(target, source) {
-    target.total += source.total || 0;
-    target.tokensIn += source.tokensIn || 0;
-    target.tokensOut += source.tokensOut || 0;
-    target.count += source.count || 0;
-    for (const [k, v] of Object.entries(source.byModel || {})) {
-      target.byModel[k] = (target.byModel[k] || 0) + v;
-    }
-    for (const [k, v] of Object.entries(source.byDay || {})) {
-      target.byDay[k] = (target.byDay[k] || 0) + v;
-    }
-    for (const [k, v] of Object.entries(source.tokensInByModel || {})) {
-      target.tokensInByModel[k] = (target.tokensInByModel[k] || 0) + v;
-    }
-    for (const [k, v] of Object.entries(source.tokensOutByModel || {})) {
-      target.tokensOutByModel[k] = (target.tokensOutByModel[k] || 0) + v;
+  function addToBucket(bucket, model, cost, tIn, tOut, date) {
+    bucket.total += cost;
+    bucket.count++;
+    bucket.tokensIn += tIn;
+    bucket.tokensOut += tOut;
+    bucket.byModel[model] = (bucket.byModel[model] || 0) + cost;
+    bucket.tokensInByModel[model] = (bucket.tokensInByModel[model] || 0) + tIn;
+    bucket.tokensOutByModel[model] = (bucket.tokensOutByModel[model] || 0) + tOut;
+    if (bucket.byDay && date) {
+      const day = formatDateShort(date);
+      bucket.byDay[day] = (bucket.byDay[day] || 0) + cost;
     }
   }
 
-  function cloneMonthData(src) {
-    return {
-      total: src.total || 0,
-      byModel: { ...src.byModel },
-      byDay: { ...src.byDay },
-      tokensInByModel: { ...src.tokensInByModel },
-      tokensOutByModel: { ...src.tokensOutByModel },
-      tokensIn: src.tokensIn || 0,
-      tokensOut: src.tokensOut || 0,
-      count: src.count || 0,
-    };
+  function addMonth(months, date, model, cost, tIn, tOut) {
+    const mk = getMonthKey(date);
+    if (!months[mk]) months[mk] = { total: 0, byModel: {}, byDay: {}, tokensInByModel: {}, tokensOutByModel: {}, tokensIn: 0, tokensOut: 0, count: 0 };
+    const m = months[mk];
+    m.total += cost;
+    m.count++;
+    m.tokensIn += tIn;
+    m.tokensOut += tOut;
+    m.byModel[model] = (m.byModel[model] || 0) + cost;
+    m.tokensInByModel[model] = (m.tokensInByModel[model] || 0) + tIn;
+    m.tokensOutByModel[model] = (m.tokensOutByModel[model] || 0) + tOut;
+    const day = formatDateShort(date);
+    m.byDay[day] = (m.byDay[day] || 0) + cost;
   }
 
-  function parseCost(text) {
-    const m = text.match(/Go\s*\(\$([\d.]+)\)/);
-    return m ? parseFloat(m[1]) : 0;
+  function getOrgId() {
+    const m = location.pathname.match(/\/console\/(wrk_[^/]+)/);
+    if (m) {
+      try { GM_setValue(ORG_KEY, m[1]); } catch {}
+      return m[1];
+    }
+    try { return GM_getValue(ORG_KEY, ""); } catch { return ""; }
   }
 
-  function parseDate(cell) {
-    const title = cell.getAttribute("title") || "";
-    const m = title.match(/(\d{1,2}\s+de\s+\w+\.)/);
-    return m ? m[1] : cell.textContent.trim();
+  async function fetchLogPage(sinceMs, untilMs, cursor, limit) {
+    const params = new URLSearchParams();
+    params.set("since", String(sinceMs));
+    params.set("until", String(untilMs));
+    params.set("category", "inference");
+    params.set("limit", String(limit));
+    if (cursor) params.set("cursor", cursor);
+    const headers = { accept: "*/*" };
+    const org = getOrgId();
+    if (org) headers["x-org-id"] = org;
+    let lastErr = null;
+    for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(`${LOGS_API_PATH}?${params.toString()}`, {
+          credentials: "include",
+          headers,
+        });
+        if (res.status === 429) {
+          await sleep(API_RETRY_BASE_MS * (attempt + 1));
+          continue;
+        }
+        if (!res.ok) {
+          const err = new Error(`request-logs HTTP ${res.status}`);
+          err.status = res.status;
+          throw err;
+        }
+        return await res.json();
+      } catch (e) {
+        if (e && e.status) throw e;
+        lastErr = e;
+        if (attempt < API_MAX_RETRIES) await sleep(API_RETRY_BASE_MS * (attempt + 1));
+      }
+    }
+    throw lastErr || new Error("request-logs fetch failed");
   }
 
-  function parseModel(cell) {
-    return cell.textContent.trim();
-  }
+  async function fetchLogsWindow(sinceMs, untilMs, onPage) {
+    const seen = new Set();
+    let pages = 0;
+    let itemCount = 0;
+    let retentionDays = null;
+    let hitRetention = false;
+    let emptyWindows = 0;
+    let oldestSeenMs = Infinity;
 
-  function parseTokens(cell) {
-    const span = cell.querySelector("span");
-    return span ? parseInt(span.textContent.trim(), 10) || 0 : 0;
-  }
+    let wUntil = untilMs;
+    while (wUntil > sinceMs) {
+      const wSince = Math.max(sinceMs, wUntil - API_WINDOW_CHUNK_MS);
+      let cursor = null;
+      let windowFresh = 0;
+      let windowPages = 0;
+      let windowAtFloor = false;
 
-  function scanCurrentPage(periodo) {
-    const table = document.querySelector(TABLE_SELECTOR);
-    if (!table) return null;
-
-    const rows = table.querySelectorAll("tbody tr");
-    const result = {
-      total: 0,
-      byModel: {},
-      byDay: {},
-      tokensInByModel: {},
-      tokensOutByModel: {},
-      tokensIn: 0,
-      tokensOut: 0,
-      count: 0,
-    };
-
-    rows.forEach((tr) => {
-      const tds = tr.querySelectorAll("td");
-      if (tds.length < 5) return;
-
-      const dateCell = tds[0];
-      const modelCell = tds[1];
-      const tokensInCell = tds[2];
-      const tokensOutCell = tds[3];
-      const costCell = tds[4];
-
-      if (periodo) {
-        const rowDate = parseRowDate(dateCell);
-        if (!rowDate || rowDate < periodo.inicio || rowDate > periodo.fim) return;
+      while (true) {
+        let data;
+        try {
+          data = await fetchLogPage(wSince, wUntil, cursor, API_PAGE_LIMIT);
+        } catch (e) {
+          if ((e.status === 400 || e.status === 422) && itemCount > 0) {
+            console.warn(`${LOG_PREFIX}[api] window ${new Date(wSince).toISOString()}→${new Date(wUntil).toISOString()} rejected (${e.status}); assuming retention floor reached`);
+            windowAtFloor = true;
+            break;
+          }
+          throw e;
+        }
+        pages++;
+        windowPages++;
+        const batch = Array.isArray(data.items) ? data.items : [];
+        const fresh = [];
+        for (const it of batch) {
+          const id = it.id || it.requestID;
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          if (it.startedAt && it.startedAt < oldestSeenMs) oldestSeenMs = it.startedAt;
+          fresh.push(it);
+        }
+        windowFresh += fresh.length;
+        itemCount += fresh.length;
+        if (typeof data.retentionDays === "number") retentionDays = data.retentionDays;
+        if (onPage) await onPage(fresh, pages);
+        if (batch.length) {
+          const oldest = batch.reduce((m, b) => (b.startedAt && b.startedAt < m ? b.startedAt : m), Infinity);
+          if (oldest < wSince) break;
+        }
+        if (!data.nextCursor) break;
+        cursor = typeof data.nextCursor === "string" ? data.nextCursor : JSON.stringify(data.nextCursor);
+        await sleep(API_PAGE_DELAY);
       }
 
-      const cost = parseCost(costCell.textContent);
-      const model = parseModel(modelCell);
-      const day = parseDate(dateCell);
-      const tIn = parseTokens(tokensInCell);
-      const tOut = parseTokens(tokensOutCell);
+      console.log(`${LOG_PREFIX}[api] window ${new Date(wSince).toISOString()} → ${new Date(wUntil).toISOString()}: fresh=${windowFresh} pages=${windowPages}${windowAtFloor ? " REJECTED(400)" : ""}`);
+      if (windowAtFloor) { hitRetention = true; break; }
+      if (windowFresh === 0) {
+        emptyWindows++;
+        if (emptyWindows >= 2) break;
+      } else {
+        emptyWindows = 0;
+      }
+      if (wSince <= sinceMs) break;
+      wUntil = wSince - 1;
+    }
 
-      result.total += cost;
-      result.byModel[model] = (result.byModel[model] || 0) + cost;
-      result.tokensInByModel[model] = (result.tokensInByModel[model] || 0) + tIn;
-      result.tokensOutByModel[model] = (result.tokensOutByModel[model] || 0) + tOut;
-      result.byDay[day] = (result.byDay[day] || 0) + cost;
-      result.tokensIn += tIn;
-      result.tokensOut += tOut;
-      result.count++;
-    });
-
-    return result;
-  }
-
-  function hasNextPage() {
-    const pag = document.querySelector(PAGINATION_SELECTOR);
-    if (!pag) return false;
-    const buttons = pag.querySelectorAll("button");
-    if (buttons.length < 2) return false;
-    return !buttons[1].disabled;
-  }
-
-  function clickNextPage() {
-    const pag = document.querySelector(PAGINATION_SELECTOR);
-    if (!pag) return false;
-    const buttons = pag.querySelectorAll("button");
-    if (buttons.length < 2 || buttons[1].disabled) return false;
-    buttons[1].click();
-    return true;
-  }
-
-  function waitForTableChange() {
-    return new Promise((resolve) => {
-      const table = document.querySelector(TABLE_SELECTOR);
-      if (!table) { setTimeout(resolve, 400); return; }
-      const tbody = table.querySelector("tbody");
-      if (!tbody) { setTimeout(resolve, 400); return; }
-      const initialHTML = tbody.innerHTML;
-      let resolved = false;
-
-      const observer = new MutationObserver(() => {
-        if (resolved) return;
-        if (tbody.innerHTML !== initialHTML) {
-          resolved = true;
-          observer.disconnect();
-          setTimeout(resolve, 400);
-        }
-      });
-      observer.observe(tbody, { childList: true, subtree: true });
-
-      setTimeout(() => {
-        if (!resolved) { resolved = true; observer.disconnect(); resolve(); }
-      }, 7000);
-    });
+    return { pages, itemCount, retentionDays, hitRetention, oldestSeenMs };
   }
 
   function saveAndDisplay(result, periodo, prevSummary = null) {
@@ -294,6 +287,8 @@
         tokensOut: prevSummary.tokensOut,
         periodKey: prevSummary.periodKey || getPeriodKey(prevSummary.periodo),
         savedAt: prevSummary.savedAt || Date.now(),
+        partial: !!prevSummary.partial,
+        empty: !!prevSummary.empty,
       } : undefined,
       timestamp: Date.now(),
     };
@@ -319,153 +314,106 @@
   }
 
   async function scanAll(currentPeriodo, prevPeriodo) {
-    const grandByModel = {};
-    const grandByDay = {};
-    const grandTokensInByModel = {};
-    const grandTokensOutByModel = {};
-    let grandTokensIn = 0;
-    let grandTokensOut = 0;
-    let grandCount = 0;
-
-    const prev = { total: 0, count: 0, tokensIn: 0, tokensOut: 0,
-                   byModel: {}, tokensInByModel: {}, tokensOutByModel: {} };
-
-    const cache = loadCache() || { version: 1, months: {} };
+    const curr = emptyResult();
+    const prev = { total: 0, count: 0, tokensIn: 0, tokensOut: 0, byModel: {}, tokensInByModel: {}, tokensOutByModel: {} };
     const monthsCache = {};
-    let pageNum = 0;
-    let sawCurrent = false;
-    let sawPrev = false;
-    let emptyPages = 0;
 
     console.log(`${LOG_PREFIX}[scanAll] currentPeriodo: ${currentPeriodo.inicio.toISOString()} → ${currentPeriodo.fim.toISOString()}`);
     if (prevPeriodo) console.log(`${LOG_PREFIX}[scanAll] prevPeriodo: ${prevPeriodo.inicio.toISOString()} → ${prevPeriodo.fim.toISOString()}`);
 
-    for (let i = 0; i < 3; i++) {
-      const v = getCurrentViewMonth();
-      if (v.getMonth() === currentPeriodo.inicio.getMonth() && v.getFullYear() === currentPeriodo.inicio.getFullYear()) break;
-      if (!clickPrevMonth()) break;
-      await waitForMonthChange(document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim());
-    }
-    await returnToFirstPage();
-    await new Promise((r) => setTimeout(r, 500));
+    const nowMs = Date.now();
+    const untilMs = Math.min(currentPeriodo.fim.getTime(), nowMs);
+    const currStartMs = currentPeriodo.inicio.getTime();
+    const currEndMs = currentPeriodo.fim.getTime();
+    const prevStartMs = prevPeriodo ? prevPeriodo.inicio.getTime() : 0;
+    const prevEndMs = prevPeriodo ? prevPeriodo.fim.getTime() : 0;
 
-    while (true) {
-      pageNum++;
-      const table = document.querySelector(TABLE_SELECTOR);
-      if (!table) break;
-
-      const rows = table.querySelectorAll("tbody tr");
-      let currPageCount = 0;
-      let prevPageCount = 0;
-
-      rows.forEach((tr) => {
-        const tds = tr.querySelectorAll("td");
-        if (tds.length < 5) return;
-        const dateCell = tds[0];
-        const modelCell = tds[1];
-        const tokensInCell = tds[2];
-        const tokensOutCell = tds[3];
-        const costCell = tds[4];
-
-        const rowDate = parseRowDate(dateCell);
-        if (!rowDate) return;
-
-        if (rowDate >= currentPeriodo.inicio && rowDate <= currentPeriodo.fim) {
-          const cost = parseCost(costCell.textContent);
-          const model = parseModel(modelCell);
-          const day = parseDate(dateCell);
-          const tIn = parseTokens(tokensInCell);
-          const tOut = parseTokens(tokensOutCell);
-
-          grandByModel[model] = (grandByModel[model] || 0) + cost;
-          grandByDay[day] = (grandByDay[day] || 0) + cost;
-          grandTokensInByModel[model] = (grandTokensInByModel[model] || 0) + tIn;
-          grandTokensOutByModel[model] = (grandTokensOutByModel[model] || 0) + tOut;
-          grandTokensIn += tIn;
-          grandTokensOut += tOut;
-          grandCount++;
-          currPageCount++;
-
-          const mk = getMonthKey(rowDate);
-          if (!monthsCache[mk]) monthsCache[mk] = { total: 0, byModel: {}, byDay: {}, tokensInByModel: {}, tokensOutByModel: {}, tokensIn: 0, tokensOut: 0, count: 0 };
-          const mc = monthsCache[mk];
-          mc.total += cost; mc.byModel[model] = (mc.byModel[model] || 0) + cost;
-          mc.tokensInByModel[model] = (mc.tokensInByModel[model] || 0) + tIn;
-          mc.tokensOutByModel[model] = (mc.tokensOutByModel[model] || 0) + tOut;
-          mc.byDay[day] = (mc.byDay[day] || 0) + cost;
-          mc.tokensIn += tIn; mc.tokensOut += tOut; mc.count++;
-          sawCurrent = true;
-        } else if (prevPeriodo && rowDate >= prevPeriodo.inicio && rowDate <= prevPeriodo.fim) {
-          const cost = parseCost(costCell.textContent);
-          const model = parseModel(modelCell);
-          const tIn = parseTokens(tokensInCell);
-          const tOut = parseTokens(tokensOutCell);
-
-          prev.total += cost;
-          prev.tokensIn += tIn;
-          prev.tokensOut += tOut;
-          prev.count++;
-          prev.byModel[model] = (prev.byModel[model] || 0) + cost;
-          prev.tokensInByModel[model] = (prev.tokensInByModel[model] || 0) + tIn;
-          prev.tokensOutByModel[model] = (prev.tokensOutByModel[model] || 0) + tOut;
-          prevPageCount++;
-
-          const mk = getMonthKey(rowDate);
-          if (!monthsCache[mk]) monthsCache[mk] = { total: 0, byModel: {}, byDay: {}, tokensInByModel: {}, tokensOutByModel: {}, tokensIn: 0, tokensOut: 0, count: 0 };
-          const mc = monthsCache[mk];
-          mc.total += cost; mc.byModel[model] = (mc.byModel[model] || 0) + cost;
-          mc.tokensInByModel[model] = (mc.tokensInByModel[model] || 0) + tIn;
-          mc.tokensOutByModel[model] = (mc.tokensOutByModel[model] || 0) + tOut;
-          mc.tokensIn += tIn; mc.tokensOut += tOut; mc.count++;
-          sawPrev = true;
-        }
-      });
-
-      const grandTotal = Object.values(grandByModel).reduce((s, v) => s + v, 0);
-      updatePanel(grandTotal, grandByModel, grandByDay, grandTokensInByModel, grandTokensOutByModel,
-        grandTokensIn, grandTokensOut, grandCount, pageNum, true, currentPeriodo);
-
-      if (currPageCount === 0 && prevPageCount === 0) {
-        emptyPages++;
-        if (sawCurrent && sawPrev && emptyPages >= 2) {
-          console.log(`${LOG_PREFIX}[scanAll] early stop: ${emptyPages} empty pages after finding both periods`);
-          break;
-        }
-      } else {
-        emptyPages = 0;
+    const classify = (it) => {
+      const t = it.startedAt;
+      if (!t) return;
+      if (it.category && it.category !== "inference") return;
+      const isGo = it.product === "go" || (typeof it.path === "string" && it.path.includes("/go/"));
+      if (!isGo) return;
+      const cost = typeof it.cost === "number" ? it.cost : 0;
+      const model = it.model || it.requestedModel || "unknown";
+      const tIn = it.inputTokens || 0;
+      const tOut = (it.outputTokens || 0) + (it.reasoningTokens || 0);
+      const d = new Date(t);
+      if (t >= currStartMs && t <= currEndMs) {
+        addToBucket(curr, model, cost, tIn, tOut, d);
+        addMonth(monthsCache, d, model, cost, tIn, tOut);
+      } else if (prevPeriodo && t >= prevStartMs && t <= prevEndMs) {
+        addToBucket(prev, model, cost, tIn, tOut, d);
+        addMonth(monthsCache, d, model, cost, tIn, tOut);
       }
+    };
 
-      if (!hasNextPage()) { console.log(`${LOG_PREFIX}[scanAll] no more pages`); break; }
-      clickNextPage();
-      await waitForTableChange();
-      await new Promise((r) => setTimeout(r, PAGE_SCAN_DELAY));
+    const onProgress = (batch, page) => {
+      batch.forEach(classify);
+      const runningTotal = Object.values(curr.byModel).reduce((s, v) => s + v, 0);
+      updatePanel(runningTotal, curr.byModel, curr.byDay, curr.tokensInByModel, curr.tokensOutByModel,
+        curr.tokensIn, curr.tokensOut, curr.count, page, true, currentPeriodo);
+    };
+
+    const floorMs = nowMs - RETENTION_DAYS * 86400000 + API_FLOOR_SAFETY_MS;
+    let sinceMs = prevPeriodo ? prevStartMs : currStartMs;
+    let prevPartial = false;
+    if (prevPeriodo && prevStartMs < floorMs) {
+      sinceMs = floorMs;
+      prevPartial = true;
+      console.log(`${LOG_PREFIX}[scanAll] prev period predates retention; clamping since to ${new Date(sinceMs).toISOString()}`);
+    }
+    updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, true, currentPeriodo);
+    let fetched;
+    try {
+      fetched = await fetchLogsWindow(sinceMs, untilMs, onProgress);
+    } catch (e) {
+      console.error(`${LOG_PREFIX}[scanAll] fetch failed:`, e, `orgId=${getOrgId() || "MISSING"}`);
+      const meta = document.getElementById("oc-meta");
+      if (meta) meta.textContent = _("apiError");
+      return;
+    }
+
+    if (prevPeriodo && !prevPartial && fetched.hitRetention) prevPartial = true;
+    if (prevPeriodo && !prevPartial && typeof fetched.retentionDays === "number") {
+      const serverFloor = nowMs - fetched.retentionDays * 86400000;
+      if (prevPeriodo.inicio.getTime() < serverFloor) prevPartial = true;
+    }
+
+    console.log(`${LOG_PREFIX}[scanAll] fetched ${fetched.itemCount} items in ${fetched.pages} pages, oldest=${Number.isFinite(fetched.oldestSeenMs) ? new Date(fetched.oldestSeenMs).toISOString() : "none"}${fetched.hitRetention ? " hitRetention=true" : ""}`);
+
+    const cache = loadCache() || { version: 1, months: {} };
+
+    let prevSummary = null;
+    if (prevPeriodo && (prev.count > 0 || prev.total > 0)) {
+      const prevKey = getPeriodKey(prevPeriodo);
+      prevSummary = { ...prev, periodo: prevPeriodo, periodKey: prevKey, savedAt: Date.now(), partial: prevPartial };
+      console.log(`${LOG_PREFIX}[scanAll] prev TOTAL: $${prev.total.toFixed(4)} (${prev.count} reqs)${prevPartial ? " [partial]" : ""}`);
+    } else if (prevPeriodo) {
+      const prevKey = getPeriodKey(prevPeriodo);
+      const s = cache.prevSummary;
+      if (s && s.periodKey === prevKey && (s.count > 0 || s.total > 0) &&
+          (Date.now() - (s.savedAt || 0)) < CACHE_MAX_AGE_MS) {
+        prevSummary = { total: s.total, count: s.count, tokensIn: s.tokensIn, tokensOut: s.tokensOut,
+                        periodo: prevPeriodo, periodKey: prevKey, savedAt: s.savedAt, partial: !!s.partial };
+        console.log(`${LOG_PREFIX}[scanAll] prev card from cache: $${s.total.toFixed(4)} (${s.count} reqs)`);
+      } else if (prevPartial) {
+        prevSummary = { total: 0, count: 0, tokensIn: 0, tokensOut: 0,
+                        periodo: prevPeriodo, periodKey: prevKey, savedAt: Date.now(), partial: true, empty: true };
+        console.log(`${LOG_PREFIX}[scanAll] prev period has no logs in server retention window`);
+      }
     }
 
     for (const [mk, mc] of Object.entries(monthsCache)) cache.months[mk] = mc;
     cache.billingPeriodKey = getPeriodKey(currentPeriodo);
     cache.savedAt = Date.now();
-
-    let prevSummary = null;
-    if (prevPeriodo) {
-      const prevKey = getPeriodKey(prevPeriodo);
-      if (prev.count > 0 || prev.total > 0) {
-        prevSummary = { ...prev, periodo: prevPeriodo, periodKey: prevKey, savedAt: Date.now() };
-        cache.prevSummary = { total: prev.total, count: prev.count, tokensIn: prev.tokensIn, tokensOut: prev.tokensOut, periodKey: prevKey, savedAt: Date.now() };
-        console.log(`${LOG_PREFIX}[scanAll] prev TOTAL: $${prev.total.toFixed(4)} (${prev.count} reqs)`);
-      }
+    if (prev.count > 0 || prev.total > 0) {
+      cache.prevSummary = { total: prev.total, count: prev.count, tokensIn: prev.tokensIn, tokensOut: prev.tokensOut, periodKey: getPeriodKey(prevPeriodo), savedAt: Date.now(), partial: prevPartial };
     }
-
     saveCache(cache);
-    const grandTotal = Object.values(grandByModel).reduce((s, v) => s + v, 0);
-    saveAndDisplay({
-      total: grandTotal, byModel: grandByModel, byDay: grandByDay,
-      tokensInByModel: grandTokensInByModel, tokensOutByModel: grandTokensOutByModel,
-      tokensIn: grandTokensIn, tokensOut: grandTokensOut, count: grandCount
-    }, currentPeriodo, prevSummary);
 
-    syncMonthOffsetFromLabel();
-    await returnToFirstPage();
-    console.log(`${LOG_PREFIX}[scanAll] done`);
+    saveAndDisplay(curr, currentPeriodo, prevSummary);
+    console.log(`${LOG_PREFIX}[scanAll] done: current $${curr.total.toFixed(4)} (${curr.count} reqs) / prev $${prev.total.toFixed(4)} (${prev.count} reqs)`);
   }
 
   function formatDateShort(date) {
@@ -500,19 +448,6 @@
     }
     const prevPeriodo = calcPrevBillingPeriod(currentPeriodo);
     await scanAll(currentPeriodo, prevPeriodo);
-  }
-
-  async function returnToFirstPage() {
-    const pag = document.querySelector(PAGINATION_SELECTOR);
-    if (!pag) return;
-    for (let i = 0; i < 50; i++) {
-      const btns = pag.querySelectorAll("button");
-      const prev = btns[0];
-      if (!prev || prev.disabled) break;
-      prev.click();
-      await waitForTableChange();
-      await new Promise((r) => setTimeout(r, 300));
-    }
   }
 
   function createPanel() {
@@ -751,28 +686,39 @@
       </div>
     `;
 
-    const container = document.querySelector('[data-slot="usage-table"]');
-    if (container) {
-      container.parentNode.insertBefore(panel, container);
-    } else {
-      const table = document.querySelector(TABLE_SELECTOR);
-      if (table) {
-        table.parentNode.insertBefore(panel, table);
-      }
+    const table = document.querySelector("#app table");
+    if (table) {
+      const holder = table.closest("div") || table;
+      if (holder.parentNode) holder.parentNode.insertBefore(panel, holder);
     }
+  }
+
+  function waitForTable(timeoutMs) {
+    return new Promise((resolve) => {
+      if (document.querySelector("#app table")) { resolve(true); return; }
+      const start = Date.now();
+      const iv = setInterval(() => {
+        if (document.querySelector("#app table")) { clearInterval(iv); resolve(true); }
+        else if (Date.now() - start > timeoutMs) { clearInterval(iv); resolve(false); }
+      }, 300);
+    });
   }
 
   function updatePanel(total, byModel, byDay, tokensInByModel, tokensOutByModel, tokensIn, tokensOut, count, pageNum, scanning, periodo, monthLabel = "", prevSummary = null) {
     createPanel();
+    if (!document.getElementById("oc-grand-total")) return;
 
     const prevEl = document.getElementById("oc-prev-period");
     if (prevEl) {
       if (prevSummary && typeof prevSummary.total === "number") {
         const prevPeriodo = prevSummary.periodo || calcPrevBillingPeriod(periodo);
         const periodTxt = prevPeriodo ? `${formatDateShort(prevPeriodo.inicio)} \u2014 ${formatDateShort(prevPeriodo.fim)}` : "";
-        const line = `<span class="oc-prev-cost">$${prevSummary.total.toFixed(2)}</span>`
+        const line = prevSummary.empty
+          ? `<span style="color:#888">${_("noPrevData")}</span>`
+          : `<span class="oc-prev-cost">$${prevSummary.total.toFixed(2)}</span>`
           + `<span class="oc-prev-sep">\u00b7</span>${prevSummary.count.toLocaleString()} ${_("requests")}`
-          + `<span class="oc-prev-sep">\u00b7</span>${prevSummary.tokensIn.toLocaleString()} ${_("_in")} / ${prevSummary.tokensOut.toLocaleString()} ${_("_out")}`;
+          + `<span class="oc-prev-sep">\u00b7</span>${prevSummary.tokensIn.toLocaleString()} ${_("_in")} / ${prevSummary.tokensOut.toLocaleString()} ${_("_out")}`
+          + (prevSummary.partial ? `<span class="oc-prev-sep">\u00b7</span><span style="color:#f0c040">${_("partial")}</span>` : "");
         prevEl.innerHTML = `<div class="oc-prev-label">${_("prevPeriod")}: ${periodTxt}</div><div class="oc-prev-line">${line}</div>`;
         prevEl.classList.add("show");
       } else {
@@ -791,7 +737,7 @@
     }
     const progressParts = [];
     if (monthLabel) progressParts.push(monthLabel);
-    if (scanning) progressParts.push(`${_("scanningPage")} ${pageNum}`);
+    if (scanning && pageNum > 0) progressParts.push(`${_("scanningPage")} ${pageNum}`);
     if (progressParts.length > 0) {
       metaParts.push(`${count} ${_("requests")} - ${progressParts.join(" - ")}...`);
     } else {
@@ -830,14 +776,7 @@
     document.getElementById("oc-reset-btn").onclick = async () => {
       GM_setValue(STORAGE_KEY, "");
       clearCache();
-      const periodo = await ensureBillingPeriod();
-      if (!periodo) {
-        const meta = document.getElementById("oc-meta");
-        if (meta) meta.textContent = _("noPeriod");
-        return;
-      }
-      const r = scanCurrentPage(periodo) || emptyResult();
-      updatePanel(r.total, r.byModel, r.byDay, r.tokensInByModel, r.tokensOutByModel, r.tokensIn, r.tokensOut, r.count, 0, false, periodo);
+      await scanAllPages();
     };
 
     document.getElementById("oc-theme-btn").onclick = () => {
@@ -847,33 +786,54 @@
     };
   }
 
-  function parseLimitsFromDoc(doc) {
-    const items = doc.querySelectorAll('[data-slot="usage-item"]');
-    if (items.length === 0) return null;
-
-    const limits = [];
-    items.forEach((item) => {
-      const label = item.querySelector('[data-slot="usage-label"]')?.textContent?.trim() || "";
-      const value = item.querySelector('[data-slot="usage-value"]')?.textContent?.trim() || "";
-      const pct = Math.min(parseFloat(value) || 0, 100);
-      const bar = item.querySelector('[data-slot="progress-bar"]');
-      const barPct = bar ? parseFloat(bar.style.width) || pct : pct;
-      const reset = item.querySelector('[data-slot="reset-time"]')?.textContent?.replace(/<!--[^>]*-->/g, "").trim() || "";
-
-      limits.push({ label, pct: Math.round(barPct), reset });
-    });
-
-    return limits;
+  function parseResetTitle(title) {
+    if (!title) return null;
+    const m = title.match(/(\d{1,2})[\/.](\d{1,2})[\/.](\d{4}),?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    if (!m) return null;
+    const a = parseInt(m[1], 10);
+    const b = parseInt(m[2], 10);
+    const y = parseInt(m[3], 10);
+    const pt = (navigator.language || "").startsWith("pt");
+    let day, month;
+    if (a > 12 && b <= 12) { day = a; month = b; }
+    else if (b > 12 && a <= 12) { day = b; month = a; }
+    else if (pt) { day = a; month = b; }
+    else { month = a; day = b; }
+    if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+    let hour = parseInt(m[4], 10);
+    if (/pm/i.test(title) && hour < 12) hour += 12;
+    if (/am/i.test(title) && hour === 12) hour = 0;
+    const d = new Date(y, month - 1, day, hour, parseInt(m[5], 10), m[6] ? parseInt(m[6], 10) : 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d.getTime();
   }
 
-  function extractResetInSec(doc) {
-    const scripts = doc.querySelectorAll("script:not([src])");
-    for (const s of scripts) {
-      const text = s.textContent;
-      const m = text.match(/monthlyUsage[^}]*resetInSec:\s*(\d+)/);
-      if (m) return parseInt(m[1], 10);
-    }
-    return null;
+  function parseLimitsFromDoc(doc) {
+    const bars = doc.querySelectorAll('[role="progressbar"][aria-label]');
+    if (!bars.length) return null;
+
+    const limits = [];
+    bars.forEach((bar) => {
+      const aria = (bar.getAttribute("aria-label") || "").trim();
+      const m = aria.match(/^(.+?)\s+usage$/i);
+      if (!m) return;
+      const name = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+      const pct = Math.min(Math.max(parseInt(bar.getAttribute("aria-valuenow") || "0", 10) || 0, 0), 100);
+      let reset = "";
+      let resetAt = null;
+      const block = (bar.parentElement && bar.parentElement.parentElement) || bar.parentElement || doc;
+      const spans = block.querySelectorAll("span[title]");
+      for (const sp of spans) {
+        const txt = (sp.textContent || "").trim();
+        if (/reset|redefin|reinici|ends in|expira/i.test(txt)) {
+          reset = txt;
+          resetAt = parseResetTitle(sp.getAttribute("title") || "");
+          break;
+        }
+      }
+      limits.push({ label: name, pct, reset, resetAt });
+    });
+
+    return limits.length ? limits : null;
   }
 
   function loadStoredData(periodo) {
@@ -906,19 +866,19 @@
   }
 
   function isGoPage() {
-    return /\/workspace\/wrk_[^/]+\/go(\?.*)?(#.*)?$/.test(location.pathname + location.search + location.hash) || location.pathname.endsWith("/go");
+    return /\/console\/[^/]+\/go(\?.*)?(#.*)?$/.test(location.pathname + location.search + location.hash);
   }
 
   function isUsagePage() {
-    return document.querySelector(TABLE_SELECTOR) !== null;
+    return /\/console\/[^/]+\/logs(\?.*)?(#.*)?$/.test(location.pathname + location.search + location.hash);
   }
 
   function captureLimitsFromPage() {
     const limits = parseLimitsFromDoc(document);
-    if (limits && limits.length > 0) {
-      const monthlyResetInSec = extractResetInSec(document);
-      GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, monthlyResetInSec, ts: Date.now() }));
-    }
+    if (!limits || limits.length === 0) return false;
+    GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, ts: Date.now() }));
+    console.log(`${LOG_PREFIX}[go] limits captured: ${limits.map((l) => `${l.label} ${l.pct}% (reset=${l.reset || "?"}${l.resetAt ? " @" + new Date(l.resetAt).toISOString() : ""})`).join(" | ")}`);
+    return true;
   }
 
   function getCachedLimits() {
@@ -945,75 +905,15 @@
     }
   }
 
-  async function fetchGoLimits() {
-    const wsId = (() => {
-      const m = location.pathname.match(/\/workspace\/(wrk_[^/]+)/);
-      return m ? m[1] : null;
-    })();
-    if (!wsId) return null;
-
-    return new Promise((resolve) => {
-      let timer, interval;
-
-      const cleanup = () => {
-        clearTimeout(timer);
-        clearInterval(interval);
-        iframe.onload = null;
-        try { iframe.remove(); } catch {}
-      };
-
-      const done = (result) => {
-        cleanup();
-        resolve(result);
-      };
-
-      const iframe = document.createElement("iframe");
-      Object.assign(iframe.style, {
-        position: "fixed",
-        top: "0",
-        left: "0",
-        width: "100%",
-        height: "100%",
-        border: "0",
-        zIndex: "-1",
-        opacity: "0",
-        pointerEvents: "none",
-      });
-
-      timer = setTimeout(() => done(null), 20000);
-
-      iframe.onload = () => {
-        let attempts = 0;
-        interval = setInterval(() => {
-          attempts++;
-          try {
-            const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
-            if (!doc) return;
-            const limits = parseLimitsFromDoc(doc);
-            if (limits && limits.length > 0) {
-              const monthlyResetInSec = extractResetInSec(doc);
-              GM_setValue(LIMITS_STORAGE_KEY, JSON.stringify({ limits, monthlyResetInSec, ts: Date.now() }));
-              done(limits);
-            } else if (attempts >= 15) {
-              done(null);
-            }
-          } catch {
-            done(null);
-          }
-        }, 1000);
-      };
-
-      iframe.src = `/workspace/${wsId}/go`;
-      document.body.appendChild(iframe);
-    });
-  }
-
   function parseRemainingDays(resetText) {
-    const daysMatch = resetText.match(/(\d+)\s*(?:days?|dias?|tage?|jours?)/i);
-    const hoursMatch = resetText.match(/(\d+)\s*(?:hours?|horas?|stunden?|heures?|hrs?)/i);
-    const days = daysMatch ? parseInt(daysMatch[1], 10) : 0;
-    const hours = hoursMatch ? parseInt(hoursMatch[1], 10) : 0;
-    return days + hours / 24;
+    if (!resetText) return 0;
+    const dm = resetText.match(/(\d+)\s*(?:d\b|days?\b|dias?\b|tage?\b|jours?\b)/i);
+    const hm = resetText.match(/(\d+)\s*(?:h\b|hrs?\b|hours?\b|horas?\b|heures?\b|stunde?n?\b)/i);
+    const mm = resetText.match(/(\d+)\s*(?:m\b|mins?\b|minutes?\b|minutos?\b)/i);
+    const days = dm ? parseInt(dm[1], 10) : 0;
+    const hours = hm ? parseInt(hm[1], 10) : 0;
+    const mins = mm ? parseInt(mm[1], 10) : 0;
+    return days + hours / 24 + mins / 1440;
   }
 
   function calcBillingPeriod() {
@@ -1022,20 +922,28 @@
     const monthly = cache.limits.find((l) => /mensal|monthly/i.test(l.label));
     if (!monthly) return null;
 
-    let remainingDays = 0;
-    const ts = cache.ts || Date.now();
-    const elapsedSec = Math.max(0, (Date.now() - ts) / 1000);
+    const now = Date.now();
 
-    if (cache.monthlyResetInSec && cache.monthlyResetInSec > 0) {
-      remainingDays = (cache.monthlyResetInSec - elapsedSec) / 86400;
-    }
-    if (!remainingDays || remainingDays <= 0) {
-      remainingDays = parseRemainingDays(monthly.reset);
+    if (monthly.resetAt && monthly.resetAt > (cache.ts || 0) - 60000) {
+      let r = new Date(monthly.resetAt);
+      for (let i = 0; i < 12 && r.getTime() <= now; i++) {
+        r = new Date(r.getFullYear(), r.getMonth() + 1, r.getDate(), r.getHours(), r.getMinutes(), r.getSeconds(), r.getMilliseconds());
+      }
+      if (r.getTime() > now) {
+        const fim = r;
+        const inicio = new Date(fim.getFullYear(), fim.getMonth() - 1, fim.getDate(), fim.getHours(), fim.getMinutes(), fim.getSeconds(), fim.getMilliseconds());
+        return { inicio, fim };
+      }
     }
 
+    const remainingDays = parseRemainingDays(monthly.reset);
     if (!remainingDays || remainingDays <= 0) return null;
 
-    const resetMoment = new Date(Date.now() + remainingDays * 86400000);
+    const ts = cache.ts || now;
+    const resetMs = ts + remainingDays * 86400000;
+    if (resetMs <= now) return null;
+
+    const resetMoment = new Date(resetMs);
     const resetDay = new Date(resetMoment.getFullYear(), resetMoment.getMonth(), resetMoment.getDate());
     const periodoInicio = new Date(resetDay.getFullYear(), resetDay.getMonth() - 1, resetDay.getDate(), 0, 0, 0, 0);
     const periodoFim = new Date(resetDay.getFullYear(), resetDay.getMonth(), resetDay.getDate(), 23, 59, 59, 999);
@@ -1044,143 +952,22 @@
   }
 
   async function ensureBillingPeriod() {
-    let periodo = calcBillingPeriod();
+    const periodo = calcBillingPeriod();
     if (periodo) return periodo;
-    await fetchGoLimits();
-    return calcBillingPeriod();
+    const cached = getCachedLimitsFull();
+    console.warn(`${LOG_PREFIX}[period] no usable Go limits cache.`,
+      cached
+        ? `cache: ts=${new Date(cached.ts || 0).toISOString()} age=${Math.round((Date.now() - (cached.ts || 0)) / 60000)}min labels=[${(cached.limits || []).map((l) => l.label).join(",")}]`
+        : "cache: EMPTY",
+      "— open the /console/.../go tab and leave it visible for a few seconds (the script captures automatically).");
+    return null;
   }
 
   function calcPrevBillingPeriod(periodo) {
     if (!periodo) return null;
-    const prevInicio = new Date(periodo.inicio.getFullYear(), periodo.inicio.getMonth() - 1, periodo.inicio.getDate(), 0, 0, 0, 0);
-    const prevFimMs = new Date(periodo.inicio.getFullYear(), periodo.inicio.getMonth(), periodo.inicio.getDate(), 0, 0, 0, 0).getTime() - 1;
-    return { inicio: prevInicio, fim: new Date(prevFimMs) };
-  }
-
-  const MONTH_NAME_MAP = {
-    jan: 0, january: 0, janeiro: 0,
-    fev: 1, feb: 1, february: 1, fevereiro: 1,
-    mar: 2, march: 2, marco: 2, "março": 2,
-    abr: 3, apr: 3, april: 3, abril: 3,
-    mai: 4, may: 4, maio: 4,
-    jun: 5, june: 5, junho: 5,
-    jul: 6, july: 6, julho: 6,
-    ago: 7, aug: 7, august: 7, agosto: 7,
-    set: 8, sep: 8, sept: 8, september: 8, setembro: 8,
-    out: 9, oct: 9, october: 9, outubro: 9,
-    nov: 10, november: 10, novembro: 10,
-    dez: 11, dec: 11, december: 11, dezembro: 11,
-  };
-
-  function parseMonthLabel(text) {
-    if (!text) return null;
-    const t = text.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    const yearMatch = t.match(/\b(20\d{2})\b/);
-    const year = yearMatch ? parseInt(yearMatch[1], 10) : new Date().getFullYear();
-    for (const [name, idx] of Object.entries(MONTH_NAME_MAP)) {
-      const n = name.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-      if (t.includes(n)) return new Date(year, idx, 1);
-    }
-    const numMatch = t.match(/\b(1[0-2]|0?[1-9])\b/);
-    if (numMatch) return new Date(year, parseInt(numMatch[1], 10) - 1, 1);
-    return null;
-  }
-
-  function syncMonthOffsetFromLabel() {
-    const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
-    const viewed = parseMonthLabel(label);
-    if (!viewed) return;
-    const now = new Date();
-    monthOffset = (viewed.getFullYear() - now.getFullYear()) * 12 + (viewed.getMonth() - now.getMonth());
-  }
-
-  function getCurrentViewMonth() {
-    const label = document.querySelector(MONTH_LABEL_SELECTOR)?.textContent?.trim();
-    const fromLabel = parseMonthLabel(label);
-    if (fromLabel) return fromLabel;
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
-  }
-
-  function parseRowDate(cell) {
-    const title = (cell.getAttribute("title") || "").trim();
-    const text = cell.textContent.trim();
-    const view = getCurrentViewMonth();
-
-    // ISO-like: 2026-07-18 or 2026/07/18
-    let m = title.match(/\b(20\d{2})[-\/](\d{1,2})[-\/](\d{1,2})\b/);
-    if (m) return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
-
-    // EN: Jul 18, 2026 / July 18 2026
-    m = title.match(/\b([A-Za-zçÇãÃéÉôÔ.]+)\s+(\d{1,2})(?:,)?\s+(20\d{2})\b/);
-    if (m) {
-      const mon = parseMonthLabel(m[1] + " " + m[3]);
-      if (mon) return new Date(mon.getFullYear(), mon.getMonth(), parseInt(m[2], 10));
-    }
-
-    // PT: 18 de jul. de 2026 / 18 de julho de 2026
-    m = title.match(/\b(\d{1,2})\s+de\s+([A-Za-zçÇãÃéÉôÔ.]+)(?:\s+de)?\s+(20\d{2})\b/i);
-    if (m) {
-      const mon = parseMonthLabel(m[2] + " " + m[3]);
-      if (mon) return new Date(mon.getFullYear(), mon.getMonth(), parseInt(m[1], 10));
-    }
-
-    // PT short in title: 18 de jul.
-    m = title.match(/\b(\d{1,2})\s+de\s+([A-Za-zçÇãÃéÉôÔ.]+)/i);
-    if (m) {
-      const mon = parseMonthLabel(m[2] + " " + view.getFullYear());
-      if (mon) return new Date(view.getFullYear(), mon.getMonth(), parseInt(m[1], 10));
-    }
-
-    const yearMatch = title.match(/\b(20\d{2})\b/);
-    const dayMatch = text.match(/(\d{1,2})/);
-    if (!dayMatch) return null;
-
-    const year = yearMatch ? parseInt(yearMatch[1], 10) : view.getFullYear();
-    return new Date(year, view.getMonth(), parseInt(dayMatch[1], 10));
-  }
-
-  function clickPrevMonth() {
-    const buttons = document.querySelectorAll(MONTH_BUTTON_SELECTOR);
-    if (buttons[0] && !buttons[0].disabled) {
-      buttons[0].click();
-      monthOffset--;
-      return true;
-    }
-    return false;
-  }
-
-  function clickNextMonth() {
-    const buttons = document.querySelectorAll(MONTH_BUTTON_SELECTOR);
-    if (buttons[1] && !buttons[1].disabled) {
-      buttons[1].click();
-      monthOffset++;
-      return true;
-    }
-    return false;
-  }
-
-  function waitForMonthChange(previousLabel) {
-    return new Promise((resolve) => {
-      const labelEl = document.querySelector(MONTH_LABEL_SELECTOR);
-      if (!labelEl) { setTimeout(resolve, 500); return; }
-      let resolved = false;
-
-      const observer = new MutationObserver(() => {
-        if (resolved) return;
-        const currentLabel = labelEl.textContent?.trim();
-        if (currentLabel && currentLabel !== previousLabel) {
-          resolved = true;
-          observer.disconnect();
-          setTimeout(resolve, 400);
-        }
-      });
-      observer.observe(labelEl, { childList: true, subtree: true, characterData: true });
-
-      setTimeout(() => {
-        if (!resolved) { resolved = true; observer.disconnect(); resolve(); }
-      }, 7000);
-    });
+    const i = periodo.inicio;
+    const prevInicio = new Date(i.getFullYear(), i.getMonth() - 1, i.getDate(), i.getHours(), i.getMinutes(), i.getSeconds(), i.getMilliseconds());
+    return { inicio: prevInicio, fim: new Date(i.getTime() - 1) };
   }
 
   function renderLimits(limits) {
@@ -1191,7 +978,7 @@
     return limits
       .map((l) => {
         let colorClass, extra = "";
-        const translatedLabel = limitLabels[l.label] || l.label;
+        const translatedLabel = (LIMIT_LABEL_I18N[locale] || {})[l.label] || l.label;
 
         if (l.pct < 50) colorClass = "oc-pct-green";
         else if (l.pct < 80) colorClass = "oc-pct-yellow";
@@ -1250,96 +1037,88 @@
       .join("");
   }
 
-  async function refreshPanelLimits() {
+  function refreshPanelLimits() {
     const limitsEl = document.getElementById("oc-limits");
     if (!limitsEl) return;
+    limitsEl.innerHTML = renderLimits(getCachedLimits());
+  }
 
-    const cached = getCachedLimits();
-    limitsEl.innerHTML = renderLimits(cached);
+  let logsBooted = false;
+  let usageBootBusy = false;
+  let goCaptured = false;
+  let lastGoCaptureAt = 0;
 
-    const fresh = await fetchGoLimits();
-    if (fresh) {
-      limitsEl.innerHTML = renderLimits(fresh);
+  async function bootUsagePage() {
+    if (usageBootBusy) return;
+    usageBootBusy = true;
+    try {
+      if (!(await waitForTable(15000))) { logsBooted = false; return; }
+
+      createPanel();
+      const metaEl = document.getElementById("oc-meta");
+      if (metaEl) metaEl.textContent = _("waitingLimits");
+
+      const periodo = await ensureBillingPeriod();
+      if (!periodo) {
+        updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, null);
+        const meta = document.getElementById("oc-meta");
+        if (meta) meta.textContent = _("noPeriod");
+        refreshPanelLimits();
+        return;
+      }
+
+      const stored = loadStoredData(periodo);
+      if (stored) {
+        const prevSummaryForPanel = hydratePrevSummary(periodo, stored);
+        updatePanel(
+          stored.total,
+          stored.byModel || {},
+          stored.byDay || {},
+          stored.tokensInByModel || {},
+          stored.tokensOutByModel || {},
+          stored.tokensIn || 0,
+          stored.tokensOut || 0,
+          stored.count || 0,
+          0,
+          false,
+          periodo,
+          "",
+          prevSummaryForPanel
+        );
+        refreshPanelLimits();
+        return;
+      }
+
+      await scanAllPages();
+      refreshPanelLimits();
+    } finally {
+      usageBootBusy = false;
     }
   }
 
-  async function init() {
+  function routeTick() {
     if (isGoPage()) {
-      captureLimitsFromPage();
-      setInterval(captureLimitsFromPage, 10000);
-      return;
-    }
-
-    if (!isUsagePage()) return;
-
-    syncMonthOffsetFromLabel();
-    createPanel();
-    const metaEl = document.getElementById("oc-meta");
-    if (metaEl) metaEl.textContent = _("waitingLimits");
-
-    const periodo = await ensureBillingPeriod();
-    if (!periodo) {
-      updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, null);
-      const meta = document.getElementById("oc-meta");
-      if (meta) meta.textContent = _("noPeriod");
-      refreshPanelLimits();
-      return;
-    }
-
-    const stored = loadStoredData(periodo);
-    if (stored) {
-      const prevSummaryForPanel = hydratePrevSummary(periodo, stored);
-      updatePanel(
-        stored.total,
-        stored.byModel || {},
-        stored.byDay || {},
-        stored.tokensInByModel || {},
-        stored.tokensOutByModel || {},
-        stored.tokensIn || 0,
-        stored.tokensOut || 0,
-        stored.count || 0,
-        0,
-        false,
-        periodo,
-        "",
-        prevSummaryForPanel
-      );
-      refreshPanelLimits();
-      return;
-    }
-
-    const pageResult = scanCurrentPage(periodo);
-    if (!pageResult) {
-      const prevSummaryForPanel = hydratePrevSummary(periodo, null);
-      updatePanel(0, {}, {}, {}, {}, 0, 0, 0, 0, false, periodo, "", prevSummaryForPanel);
-      refreshPanelLimits();
-      return;
-    }
-
-    const cache = loadCache();
-    const cacheValid = isCacheValid(cache, periodo);
-    const currentMonthKey = getMonthKey(new Date());
-    const result = emptyResult();
-
-    if (cacheValid && cache.months) {
-      for (const [mk, data] of Object.entries(cache.months)) {
-        if (mk !== currentMonthKey) {
-          mergeResult(result, data);
+      const now = Date.now();
+      if (!goCaptured || now - lastGoCaptureAt > 10000) {
+        if (captureLimitsFromPage()) {
+          goCaptured = true;
+          lastGoCaptureAt = now;
         }
       }
+      return;
     }
+    if (isUsagePage()) {
+      const panelAlive = document.getElementById("oc-go-totalizer") !== null;
+      if ((!logsBooted || !panelAlive) && !usageBootBusy) {
+        logsBooted = true;
+        bootUsagePage();
+      }
+    }
+  }
 
-    mergeResult(result, pageResult);
-
-    const prevSummaryForPanel = hydratePrevSummary(periodo, null);
-    updatePanel(
-      result.total, result.byModel, result.byDay,
-      result.tokensInByModel, result.tokensOutByModel,
-      result.tokensIn, result.tokensOut, result.count,
-      0, false, periodo, "", prevSummaryForPanel
-    );
-
-    refreshPanelLimits();
+  function start() {
+    routeTick();
+    setInterval(routeTick, 1000);
   }
 
   function hydratePrevSummary(periodo, stored) {
@@ -1347,7 +1126,7 @@
     if (!prevPeriodo) return null;
     const prevKey = getPeriodKey(prevPeriodo);
 
-    const usable = (s) => s && s.periodKey === prevKey && !s.skipped && (s.count > 0 || s.total > 0);
+    const usable = (s) => s && s.periodKey === prevKey && !s.skipped && (s.count > 0 || s.total > 0 || s.empty);
 
     if (stored && usable(stored.prevSummary)) {
       return {
@@ -1356,6 +1135,8 @@
         tokensIn: stored.prevSummary.tokensIn,
         tokensOut: stored.prevSummary.tokensOut,
         periodo: prevPeriodo,
+        partial: !!stored.prevSummary.partial,
+        empty: !!stored.prevSummary.empty,
       };
     }
 
@@ -1368,6 +1149,7 @@
         tokensIn: cache.prevSummary.tokensIn,
         tokensOut: cache.prevSummary.tokensOut,
         periodo: prevPeriodo,
+        partial: !!cache.prevSummary.partial,
       };
     }
 
@@ -1375,8 +1157,8 @@
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => setTimeout(init, 800));
+    document.addEventListener("DOMContentLoaded", () => setTimeout(start, 500));
   } else {
-    setTimeout(init, 800);
+    setTimeout(start, 500);
   }
 })();

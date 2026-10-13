@@ -3,12 +3,13 @@
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-✅-brightgreen)](https://www.tampermonkey.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-**Totalizador de crédito/uso do OpenCode Go.** Um userscript para Tampermonkey que adiciona um painel flutuante na página de uso do OpenCode, mostrando:
+**Totalizador de crédito/uso do OpenCode Go.** Um userscript para Tampermonkey que adiciona um painel flutuante na página de logs do OpenCode Console (`/console/wrk_.../logs`), mostrando:
 
-- **Total geral** de todos os custos somados
+- **Total geral** de todos os custos somados do período de cobrança atual
+- **Card do período anterior** — totais do último ciclo fechado (sujeito à retenção de logs do servidor)
 - **Breakdown por modelo** — quanto cada modelo consumiu (custo e tokens in/out)
 - **Breakdown por dia** — gasto por data
-- **Limites do Go em tempo real** — busca os percentuais de Uso Contínuo, Semanal e Mensal direto da página `/go`
+- **Limites do Go em tempo real** — percentuais de Uso contínuo, Semanal e Mensal capturados da aba `/go`
 - **Projeção mensal** — calcula se o ritmo atual vai estourar o limite de $60/mês
 
 *(Adicione aqui um screenshot do painel em ação)*
@@ -28,14 +29,14 @@
 
 5. Pressione `Ctrl+S` (ou `Cmd+S`) para salvar.
 
-6. Pronto! Navegue até a página de uso do OpenCode (`/workspace/wrk_.../go`) que o painel vai aparecer automaticamente.
+6. Pronto! Navegue até a página de logs do Console (`/console/wrk_.../logs`) que o painel aparece acima da tabela. Abra a aba Go (`/console/wrk_.../go`) pelo menos uma vez para o script capturar o período de cobrança e os limites (ele captura automaticamente enquanto você estiver nela).
 
 ## Como usar
 
-- Ao entrar na página de uso, o script escaneia a página atual e exibe os totais
-- Clique em **Escanear todas as páginas** para percorrer o histórico completo
-- Clique em **Resetar** para limpar o cache e recomeçar do zero
-- Os limites do Go são atualizados automaticamente de fundo
+- Ao entrar na página, o script restaura os últimos totais salvos e o período de cobrança
+- Clique em **Atualizar totais** para buscar o período atual + anterior direto da API `request-logs` (rápido — sem paginar tabela)
+- Clique em **Resetar** para limpar os dados e recomeçar
+- O card do **período anterior** pode indicar "parcial" ou "sem logs disponíveis": o servidor guarda os logs por ~30 dias (na prática, menos). Dica: rode um **Atualizar totais** logo após o dia do reset do ciclo (ex.: dia 18) para congelar o período recém-encerrado enquanto ele ainda está na retenção
 
 ## Funcionalidades
 
@@ -47,12 +48,13 @@
 | **Limites Go** | Barras de progresso de Uso Contínuo, Semanal e Mensal |
 | **Projeção 30 dias** | Calcula se o ritmo atual vai estourar o limite mensal |
 | **i18n** | Detecta o idioma do navegador — painel em português ou inglês |
-| **Cache** | Dados persistem entre páginas (via GM_setValue) |
-| **Paginação** | Escaneia automaticamente todas as páginas do histórico |
+| **Cache** | Dados persistem entre páginas e reinícios (via GM_setValue) |
+| **Scan via API** | Busca o período inteiro pela API `request-logs` com paginação por cursor — sem raspar a tabela |
+| **Consciente de retenção** | Marca o período anterior como parcial (ou vazio) quando a retenção de logs do servidor não o cobre mais |
 
 ## Compatibilidade
 
-- Funciona em todas as páginas `https://opencode.ai/*`
+- Requer o OpenCode Console (`https://opencode.ai/console/wrk_...`)
 - Testado no Chrome, Firefox e Edge com Tampermonkey
 - Pode funcionar em Violentmonkey/Greasemonkey (não testado)
 
